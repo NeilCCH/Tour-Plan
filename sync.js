@@ -90,6 +90,48 @@ export const signUp = (email, password) => supabase.auth.signUp({ email, passwor
 export const signIn = (email, password) => supabase.auth.signInWithPassword({ email, password });
 export const signOut = () => supabase.auth.signOut();
 
+// ---- 照片雲端同步(私有 Storage 桶,只有該行程協作者可讀寫)---------------------
+// 桶名 photos;路徑格式 {tripId}/{momentId}/{photoId}.jpg,權限靠 storage policy
+// 檢查「你是不是這趟的擁有者或成員」(見 supabase-schema.sql)。
+const PHOTO_BUCKET = 'photos';
+
+function dataUrlToBlob(dataUrl) {
+  const [head, b64] = dataUrl.split(',');
+  const mime = (head.match(/:(.*?);/) || [])[1] || 'image/jpeg';
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return new Blob([arr], { type: mime });
+}
+
+// 上傳一張照片,回傳雲端路徑(存回 moment.photoPath 供各裝置取用)
+export async function uploadPhoto(tripId, momentId, photoId, dataUrl) {
+  const path = `${tripId}/${momentId}/${photoId}.jpg`;
+  const blob = dataUrlToBlob(dataUrl);
+  const { error } = await supabase.storage.from(PHOTO_BUCKET)
+    .upload(path, blob, { contentType: blob.type || 'image/jpeg', upsert: true });
+  if (error) throw error;
+  return path;
+}
+
+// 下載一張雲端照片,回傳 dataURL(供顯示並快取回本機)
+export async function downloadPhoto(path) {
+  const { data, error } = await supabase.storage.from(PHOTO_BUCKET).download(path);
+  if (error || !data) throw (error || new Error('照片下載失敗'));
+  return await new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(r.result);
+    r.onerror = () => rej(r.error);
+    r.readAsDataURL(data);
+  });
+}
+
+// 刪除雲端照片(刪記錄時清理,失敗不致命)
+export async function deletePhoto(path) {
+  if (!path) return;
+  try { await supabase.storage.from(PHOTO_BUCKET).remove([path]); } catch (_) {}
+}
+
 // ---- 雲端 <-> 本地 資料形狀轉換 ----------------------------------------------
 // 雲端每張表欄位:id(uuid) / user_id / data(jsonb=整筆本地物件) / updated_at / deleted
 // 拉回時用雲端權威的 user_id 蓋上 ownerId,確保資料正確歸屬到擁有者

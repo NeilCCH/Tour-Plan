@@ -215,3 +215,63 @@ begin
    where id = p_trip;
 end; $$;
 grant execute on function public.remove_member(uuid, text) to authenticated;
+
+-- ===========================================================================
+-- 照片雲端同步:私有 Storage 桶「photos」,只有該行程的擁有者或協作者能上傳/讀取
+-- ---------------------------------------------------------------------------
+-- App 上傳路徑格式:{tripId}/{momentId}/{photoId}.jpg
+-- 第一段資料夾 = tripId;下面的政策用它比對「你是不是這趟的擁有者或成員」。
+-- 桶設為私有(public=false),沒有下面的政策就完全讀不到 → 達成「限協作者觀看」。
+-- 可重複執行。
+-- ===========================================================================
+
+-- 建立私有桶(已存在則略過)
+insert into storage.buckets (id, name, public)
+  values ('photos', 'photos', false)
+  on conflict (id) do nothing;
+
+-- 讀取(下載):擁有者或協作成員
+drop policy if exists "trip members read photos" on storage.objects;
+create policy "trip members read photos" on storage.objects for select to authenticated
+  using (
+    bucket_id = 'photos'
+    and exists (select 1 from public.trips t
+      where t.id::text = (storage.foldername(name))[1]
+        and (t.user_id = auth.uid() or coalesce(t.data->'members','[]'::jsonb) ? auth.uid()::text))
+  );
+
+-- 上傳(新增):擁有者或協作成員
+drop policy if exists "trip members insert photos" on storage.objects;
+create policy "trip members insert photos" on storage.objects for insert to authenticated
+  with check (
+    bucket_id = 'photos'
+    and exists (select 1 from public.trips t
+      where t.id::text = (storage.foldername(name))[1]
+        and (t.user_id = auth.uid() or coalesce(t.data->'members','[]'::jsonb) ? auth.uid()::text))
+  );
+
+-- 覆蓋(upsert 需要):擁有者或協作成員
+drop policy if exists "trip members update photos" on storage.objects;
+create policy "trip members update photos" on storage.objects for update to authenticated
+  using (
+    bucket_id = 'photos'
+    and exists (select 1 from public.trips t
+      where t.id::text = (storage.foldername(name))[1]
+        and (t.user_id = auth.uid() or coalesce(t.data->'members','[]'::jsonb) ? auth.uid()::text))
+  )
+  with check (
+    bucket_id = 'photos'
+    and exists (select 1 from public.trips t
+      where t.id::text = (storage.foldername(name))[1]
+        and (t.user_id = auth.uid() or coalesce(t.data->'members','[]'::jsonb) ? auth.uid()::text))
+  );
+
+-- 刪除:擁有者或協作成員(刪記錄時順手清雲端照片)
+drop policy if exists "trip members delete photos" on storage.objects;
+create policy "trip members delete photos" on storage.objects for delete to authenticated
+  using (
+    bucket_id = 'photos'
+    and exists (select 1 from public.trips t
+      where t.id::text = (storage.foldername(name))[1]
+        and (t.user_id = auth.uid() or coalesce(t.data->'members','[]'::jsonb) ? auth.uid()::text))
+  );

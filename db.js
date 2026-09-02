@@ -237,6 +237,7 @@ async function createMoment(tripId, data = {}) {
     weather: data.weather || null,     // 打卡當下天氣 { code, temp }(可無)
     photoId: data.photoId || null,     // 對應本機 assets 的 id(照片存本機)
     hasPhoto: !!data.photoId,          // 給別台裝置知道「有照片但在對方手機」
+    photoPath: data.photoPath || '',   // 照片在雲端 Storage 的路徑(有值=已上傳,協作者可下載)
     audioId: data.audioId || null,     // 語音檔(存本機 assets,不同步)
     hasAudio: !!data.audioId,          // 給別台裝置知道「有語音但在對方手機」
     authorId: data.authorId || null,   // 誰記的(旅伴動態牆顯示用)
@@ -269,6 +270,12 @@ async function deleteMoment(id) {
 // ---- 本機資產(照片 dataURL 等,不同步雲端)---------------------------------
 async function putAsset(dataUrl) {
   const id = newId();
+  await put('assets', { id, dataUrl, createdAt: Date.now() });
+  return id;
+}
+// 用指定 id 寫入本機資產(把雲端下載回來的照片快取到同一個 photoId,之後離線也能看)
+async function putAssetWithId(id, dataUrl) {
+  if (!id || !dataUrl) return id;
   await put('assets', { id, dataUrl, createdAt: Date.now() });
   return id;
 }
@@ -318,7 +325,7 @@ export const db = {
   createTrip, listTrips, getTrip, updateTrip, deleteTrip, setTripPublic,
   createPlace, listPlaces, getPlace, updatePlace, deletePlace,
   createMoment, listMoments, updateMoment, deleteMoment,
-  putAsset, getAsset,
+  putAsset, putAssetWithId, getAsset,
   migrateCategories, claimOwnerlessTrips,
   _sync: sync,
 };

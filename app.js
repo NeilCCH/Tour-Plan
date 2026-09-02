@@ -12,7 +12,7 @@
 import { db, CATEGORIES, STATUSES, DEFAULT_STAY } from './db.js';
 import { geocode, geocodeCandidates, legModes, modeEstimate, orderFromStart, nearestOrder, kmeansDays, orderClusters, haversine } from './geo.js';
 
-const APP_VERSION = 'v76'; // 顯示在帳號視窗,方便確認手機跑的是哪一版
+const APP_VERSION = 'v77'; // 顯示在帳號視窗,方便確認手機跑的是哪一版
 const app = document.getElementById('app');
 const header = document.getElementById('header');
 
@@ -1595,7 +1595,7 @@ function momentBody(trip, places, moments) {
     if (k !== curKey) { curKey = k; html += `<div class="tl-day">${dayLabel(m.takenAt)}</div>`; }
     const place = m.placeId ? byId.get(m.placeId) : null;
     const photo = m.photoId
-      ? `<div class="m-photo"><img data-asset="${esc(m.photoId)}" alt="旅途照片"></div>`
+      ? `<div class="m-photo"><img data-asset="${esc(m.photoId)}" data-path="${esc(m.photoPath || '')}" alt="旅途照片"></div>`
       : (m.hasPhoto ? '<div class="m-photo ph">📷 照片存在拍攝的裝置上</div>' : '');
     const audio = m.audioId
       ? `<div class="m-audio"><audio data-audio="${esc(m.audioId)}" controls preload="none"></audio></div>`
@@ -1622,15 +1622,51 @@ function momentBody(trip, places, moments) {
   return html;
 }
 
-// 非同步把本機照片/語音塞進畫面(照片、語音只存本機,別台裝置顯示「已不在本機」)
+// 取一張照片:本機優先;本機沒有但雲端有(協作者拍的)就下載並快取回本機。
+async function loadMomentPhoto(assetId, path) {
+  if (assetId) {
+    const local = await db.getAsset(assetId).catch(() => null);
+    if (local) return local;
+  }
+  if (path && cloud && cloud.downloadPhoto) {
+    try {
+      const dataUrl = await cloud.downloadPhoto(path);
+      if (dataUrl && assetId) await db.putAssetWithId(assetId, dataUrl).catch(() => {});
+      return dataUrl;
+    } catch (_) { return null; }
+  }
+  return null;
+}
+
+// 背景把「本機有照片、但雲端還沒上傳」的 moment 一張張上傳,並把路徑寫回(隨同步擴散給協作者)。
+// 別台裝置拍的照片(本機沒有原檔)不會由我上傳,交給原裝置處理。
+let _photoSyncing = false;
+async function syncTripPhotos(tripId) {
+  if (_photoSyncing || !cloud || !cloud.uploadPhoto || !currentUser || !navigator.onLine) return;
+  _photoSyncing = true;
+  try {
+    const moments = await db.listMoments(tripId);
+    for (const m of moments) {
+      if (!m.photoId || m.photoPath) continue;
+      const dataUrl = await db.getAsset(m.photoId).catch(() => null);
+      if (!dataUrl) continue; // 照片不在本機 → 不是我上傳的責任
+      try {
+        const path = await cloud.uploadPhoto(tripId, m.id, m.photoId, dataUrl);
+        await db.updateMoment(m.id, { photoPath: path }); // 觸發同步,協作者才收得到
+      } catch (_) { /* 稍後(下次進頁/上線)再試 */ }
+    }
+  } finally { _photoSyncing = false; }
+}
+
+// 非同步把照片/語音塞進畫面。照片:本機沒有就從雲端抓(協作者也看得到);語音只存本機。
 function fillLocalAssets() {
   app.querySelectorAll('img[data-asset]').forEach(async (im) => {
-    const url = await db.getAsset(im.dataset.asset).catch(() => null);
-    if (url) im.src = url; else im.closest('.m-photo')?.replaceChildren(document.createTextNode('📷 照片已不在本機'));
+    const url = await loadMomentPhoto(im.dataset.asset, im.dataset.path || '');
+    if (url) im.src = url; else im.closest('.m-photo')?.replaceChildren(document.createTextNode('📷 照片載入不到'));
   });
   app.querySelectorAll('audio[data-audio]').forEach(async (au) => {
     const url = await db.getAsset(au.dataset.audio).catch(() => null);
-    if (url) au.src = url; else au.closest('.m-audio')?.replaceChildren(document.createTextNode('🎤 語音已不在本機'));
+    if (url) au.src = url; else au.closest('.m-audio')?.replaceChildren(document.createTextNode('🎤 語音存在錄製的裝置上'));
   });
 }
 // 在指定容器畫出足跡地圖(打卡點 + 已定位景點)
@@ -1661,6 +1697,7 @@ async function renderFootprintMap(box, moments, places) {
 // 「旅途」分頁的事件:照片載入、卡片點擊編輯、足跡地圖
 function wireMomentTab(trip, places, moments) {
   fillLocalAssets();
+  syncTripPhotos(trip.id).catch(() => {}); // 背景把本機新照片上雲(協作者才看得到)
   // 靠近提示:更新監看用的景點清單,並依開關啟停
   proximityPlaces = places;
   if (proximityOn) startProximity(trip); else stopProximity();
@@ -1715,10 +1752,10 @@ function bookBody(trip, places, moments) {
   const avgRating = rated.length ? rated.reduce((s, m) => s + m.rating, 0) / rated.length : 0;
 
   // 每個景點的代表照片與評分(取自關聯到它的旅途記錄)
-  const placePhoto = {}, placeRating = {};
+  const placePhoto = {}, placeRating = {}, placePath = {};
   moments.forEach((m) => {
     if (!m.placeId) return;
-    if (m.photoId && !placePhoto[m.placeId]) placePhoto[m.placeId] = m.photoId;
+    if (m.photoId && !placePhoto[m.placeId]) { placePhoto[m.placeId] = m.photoId; placePath[m.placeId] = m.photoPath || ''; }
     if (m.rating) placeRating[m.placeId] = Math.max(placeRating[m.placeId] || 0, m.rating);
   });
 
@@ -1747,7 +1784,7 @@ function bookBody(trip, places, moments) {
   if (highlights.length) {
     html += `<div class="book-sec-title">✨ 精選時刻</div><div class="hl-strip">`;
     for (const m of highlights) {
-      const ph = m.photoId ? `<img data-asset="${esc(m.photoId)}" alt="">` : '<div class="hl-noimg">📝</div>';
+      const ph = m.photoId ? `<img data-asset="${esc(m.photoId)}" data-path="${esc(m.photoPath || '')}" alt="">` : '<div class="hl-noimg">📝</div>';
       html += `<div class="hl-card">${ph}<div class="hl-cap">${m.rating ? starsView(m.rating) : ''}${m.text ? `<span>${esc(m.text.slice(0, 40))}</span>` : ''}</div></div>`;
     }
     html += `</div>`;
@@ -1763,7 +1800,7 @@ function bookBody(trip, places, moments) {
       html += `<div class="bd-empty">這天沒有安排景點</div>`;
     } else {
       for (const p of dayPlaces) {
-        const ph = placePhoto[p.id] ? `<img class="bd-thumb" data-asset="${esc(placePhoto[p.id])}" alt="">` : `<div class="bd-thumb ph">${ic('pin')}</div>`;
+        const ph = placePhoto[p.id] ? `<img class="bd-thumb" data-asset="${esc(placePhoto[p.id])}" data-path="${esc(placePath[p.id] || '')}" alt="">` : `<div class="bd-thumb ph">${ic('pin')}</div>`;
         const visitedTag = p.status === '已造訪' ? '<span class="bd-visited">✓ 已造訪</span>' : '';
         const rt = placeRating[p.id] ? starsView(placeRating[p.id]) : '';
         html += `<div class="bd-place">${ph}<div class="bd-info"><div class="bd-name">${esc(p.name)} ${catTag(p.category)}</div>${(visitedTag || rt) ? `<div class="bd-tags">${visitedTag}${rt}</div>` : ''}</div></div>`;
@@ -1798,7 +1835,7 @@ function openBookMaker(trip, places, moments) {
   const rows = materials.map((m) => {
     const place = m.placeId ? byId.get(m.placeId) : null;
     const label = [hhmm(m.takenAt), place ? place.name : '', m.text ? m.text.slice(0, 18) : ''].filter(Boolean).join(' · ') || '記錄';
-    const thumb = m.photoId ? `<img class="bm-thumb" data-asset="${esc(m.photoId)}" alt="">` : `<div class="bm-thumb ph">${m.text ? '📝' : (m.rating ? '★' : '📍')}</div>`;
+    const thumb = m.photoId ? `<img class="bm-thumb" data-asset="${esc(m.photoId)}" data-path="${esc(m.photoPath || '')}" alt="">` : `<div class="bm-thumb ph">${m.text ? '📝' : (m.rating ? '★' : '📍')}</div>`;
     return `<label class="bm-row"><input type="checkbox" class="bm-pick" value="${esc(m.id)}" checked>${thumb}<span>${esc(label)}</span></label>`;
   }).join('');
 
@@ -1831,7 +1868,7 @@ function openBookMaker(trip, places, moments) {
     </div>
   `, (sheet, close) => {
     sheet.querySelectorAll('img[data-asset]').forEach(async (im) => {
-      const u = await db.getAsset(im.dataset.asset).catch(() => null);
+      const u = await loadMomentPhoto(im.dataset.asset, im.dataset.path || '');
       if (u) im.src = u; else im.replaceWith(Object.assign(document.createElement('div'), { className: 'bm-thumb ph', textContent: '📷' }));
     });
     const picks = () => [...sheet.querySelectorAll('.bm-pick')];
@@ -1861,8 +1898,8 @@ function openBookMaker(trip, places, moments) {
       const first = picks().filter((c) => c.checked).map((c) => c.value)
         .map((id) => moments.find((m) => m.id === id)).find((m) => m && m.photoId);
       if (!first) { setBack('', '入選素材裡沒有照片可當底圖'); return; }
-      const u = await db.getAsset(first.photoId).catch(() => null);
-      setBack(u || '', u ? '已選:第一張入選照片' : '照片不在本機');
+      const u = await loadMomentPhoto(first.photoId, first.photoPath);
+      setBack(u || '', u ? '已選:第一張入選照片' : '照片載入不到');
     };
 
     sheet.querySelector('#bm-go').onclick = async () => {
@@ -2058,7 +2095,7 @@ async function generateBookPDF(trip, places, moments, opts) {
   // 底圖影像:優先用使用者上傳的,否則用第一張入選照片
   let backImg = null;
   let backUrl = opts.backdropUrl;
-  if (!backUrl) { const fp = chosen.find((m) => m.photoId); if (fp) backUrl = await db.getAsset(fp.photoId).catch(() => null); }
+  if (!backUrl) { const fp = chosen.find((m) => m.photoId); if (fp) backUrl = await loadMomentPhoto(fp.photoId, fp.photoPath); }
   if (backUrl) backImg = await loadImg(backUrl).catch(() => null);
 
   // 依日程分組
@@ -2118,7 +2155,7 @@ async function generateBookPDF(trip, places, moments, opts) {
       if (m.weather) caps.push(`${wmoEmoji(m.weather.code)} ${m.weather.temp}°`);
       if (m.rating) caps.push('★'.repeat(m.rating));
       if (m.photoId) {
-        const u = await db.getAsset(m.photoId).catch(() => null);
+        const u = await loadMomentPhoto(m.photoId, m.photoPath);
         if (u) { const im = await loadImg(u).catch(() => null); if (im) { const r = drawContain(ctx, im, 84, y, PGW - 168, 600, 22); y = r.dy + r.h + 12; } }
       }
       ctx.fillStyle = '#0d7d76'; ctx.font = '600 32px sans-serif'; ctx.fillText(caps.join(' · '), 88, y + 30); y += 48;
@@ -2214,7 +2251,7 @@ function openVideoMaker(trip, places, moments) {
   const rows = photos.map((m) => {
     const place = m.placeId ? byId.get(m.placeId) : null;
     const label = [hhmm(m.takenAt), place ? place.name : '', m.text ? m.text.slice(0, 16) : ''].filter(Boolean).join(' · ') || '照片';
-    return `<label class="bm-row"><input type="checkbox" class="vm-pick" value="${esc(m.id)}" checked><img class="bm-thumb" data-asset="${esc(m.photoId)}" alt=""><span>${esc(label)}</span></label>`;
+    return `<label class="bm-row"><input type="checkbox" class="vm-pick" value="${esc(m.id)}" checked><img class="bm-thumb" data-asset="${esc(m.photoId)}" data-path="${esc(m.photoPath || '')}" alt=""><span>${esc(label)}</span></label>`;
   }).join('');
   const supported = videoSupported();
 
@@ -2246,7 +2283,7 @@ function openVideoMaker(trip, places, moments) {
     </div>
   `, (sheet, close) => {
     sheet.querySelectorAll('img[data-asset]').forEach(async (im) => {
-      const u = await db.getAsset(im.dataset.asset).catch(() => null);
+      const u = await loadMomentPhoto(im.dataset.asset, im.dataset.path || '');
       if (u) im.src = u; else im.replaceWith(Object.assign(document.createElement('div'), { className: 'bm-thumb ph', textContent: '📷' }));
     });
     let dur = 60;
@@ -2277,8 +2314,8 @@ function openVideoMaker(trip, places, moments) {
       try {
         const chosen = photos.filter((m) => ids.has(m.id));
         const urls = [];
-        for (const m of chosen) { const u = await db.getAsset(m.photoId).catch(() => null); if (u) urls.push(u); }
-        if (!urls.length) throw new Error('選到的照片都不在本機');
+        for (const m of chosen) { const u = await loadMomentPhoto(m.photoId, m.photoPath); if (u) urls.push(u); }
+        if (!urls.length) throw new Error('選到的照片都載入不到');
         const imgs = await Promise.all(urls.map(loadImg));
         const dims = fmt === 'h' ? { W: 1920, H: 1080 } : { W: 1080, H: 1920 };
         const blob = await generateVideoBlob(trip.name, imgs, dur, dims, (p) => { bar.style.width = Math.round(p * 100) + '%'; });
@@ -2516,6 +2553,7 @@ function openMomentSheet(trip, places, moment = null, prefill = null) {
     const delBtn = sheet.querySelector('#m-del');
     if (delBtn) delBtn.onclick = async () => {
       if (!confirm('刪除這則記錄?(照片也會一併刪除)')) return;
+      if (moment.photoPath && cloud && cloud.deletePhoto) cloud.deletePhoto(moment.photoPath).catch(() => {}); // 順手清雲端照片
       await db.deleteMoment(moment.id);
       close(); render();
     };
