@@ -12,7 +12,7 @@
 import { db, CATEGORIES, STATUSES, DEFAULT_STAY } from './db.js';
 import { geocode, geocodeCandidates, legModes, modeEstimate, orderFromStart, nearestOrder, kmeansDays, orderClusters, haversine } from './geo.js';
 
-const APP_VERSION = 'v77'; // 顯示在帳號視窗,方便確認手機跑的是哪一版
+const APP_VERSION = 'v78'; // 顯示在帳號視窗,方便確認手機跑的是哪一版
 const app = document.getElementById('app');
 const header = document.getElementById('header');
 
@@ -1038,6 +1038,11 @@ function openTripSheet(trip = null) {
         <option value="">未設定</option>
         ${COUNTRIES.map((c) => `<option value="${c.code}" ${trip?.country === c.code ? 'selected' : ''}>${flagOf(c.code)} ${esc(c.name)}</option>`).join('')}
       </select></label>
+    ${editing && trip.ownerId === currentUser?.id ? `
+    <label class="field"><span class="lab">照片雲端保存期限(到期只刪雲端壓縮版,手機原圖保留)</span>
+      <select id="f-retain" class="select">
+        ${[[0, '永久保存(不自動刪)'], [90, '3 個月'], [180, '6 個月'], [365, '1 年']].map(([v, l]) => `<option value="${v}" ${(trip.photoRetentionDays ?? 0) === v ? 'selected' : ''}>${l}</option>`).join('')}
+      </select></label>` : ''}
     <div class="btn-row">
       <button class="btn primary" id="f-save">${editing ? '儲存' : '建立旅程'}</button>
       ${editing && trip.ownerId === currentUser?.id ? '<button class="btn danger" id="f-del">刪除這趟旅程</button>' : ''}
@@ -1053,6 +1058,8 @@ function openTripSheet(trip = null) {
         people: sheet.querySelector('#f-people').value,
         country: sheet.querySelector('#f-country').value,
       };
+      const retainSel = sheet.querySelector('#f-retain');
+      if (retainSel) data.photoRetentionDays = Number(retainSel.value); // 只有擁有者能改
       if (!data.name) { sheet.querySelector('#f-name').focus(); return; }
       if (editing) await db.updateTrip(trip.id, data);
       else { const t = await db.createTrip({ ...data, ownerId: currentUser?.id }); location.hash = `#/trip/${t.id}`; }
@@ -1658,6 +1665,23 @@ async function syncTripPhotos(tripId) {
   } finally { _photoSyncing = false; }
 }
 
+// 照片保存期限:只有擁有者的 App 執行,把超過期限的「雲端」照片刪掉(手機原圖不動),並清掉 photoPath。
+async function enforcePhotoRetention(trip) {
+  const days = Number(trip.photoRetentionDays) || 0;
+  if (!days || !cloud || !cloud.deletePhoto || !currentUser || !navigator.onLine) return;
+  if (trip.ownerId !== currentUser.id) return; // 僅擁有者可清共享照片
+  const cutoff = Date.now() - days * 86400000;
+  const moments = await db.listMoments(trip.id);
+  for (const m of moments) {
+    if (!m.photoPath) continue;
+    if ((m.takenAt || m.createdAt || 0) >= cutoff) continue; // 未到期
+    try {
+      await cloud.deletePhoto(m.photoPath);
+      await db.updateMoment(m.id, { photoPath: '' }); // 清路徑 → 協作者端不再嘗試下載
+    } catch (_) { /* 下次再試 */ }
+  }
+}
+
 // 非同步把照片/語音塞進畫面。照片:本機沒有就從雲端抓(協作者也看得到);語音只存本機。
 function fillLocalAssets() {
   app.querySelectorAll('img[data-asset]').forEach(async (im) => {
@@ -1698,6 +1722,7 @@ async function renderFootprintMap(box, moments, places) {
 function wireMomentTab(trip, places, moments) {
   fillLocalAssets();
   syncTripPhotos(trip.id).catch(() => {}); // 背景把本機新照片上雲(協作者才看得到)
+  enforcePhotoRetention(trip).catch(() => {}); // 擁有者:清掉超過保存期限的雲端照片
   // 靠近提示:更新監看用的景點清單,並依開關啟停
   proximityPlaces = places;
   if (proximityOn) startProximity(trip); else stopProximity();

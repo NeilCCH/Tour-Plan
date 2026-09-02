@@ -116,6 +116,7 @@ async function createTrip({ name, startDate = '', endDate = '', people = 1, coun
     ownerId,                        // 這趟的擁有者(登入者 id);列表依此過濾
     members: [],                    // 協作者的 uid 清單(擁有者不列在內)
     inviteCode: '',                 // 邀請碼(產生邀請連結時才填)
+    photoRetentionDays: 365,        // 雲端照片保存天數(0=永久;到期由擁有者的 App 自動清雲端那份)
     public: false,                  // 是否開放公開分享(唯讀)
     fts: {},                        // 欄位級修改時間
     createdAt: now, updatedAt: now, deleted: false,
