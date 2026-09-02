@@ -15,4 +15,4 @@ export const SUPABASE_ANON_KEY =
 
 // Google Drive 備份用的 OAuth 用戶端 ID(網頁型;此值可公開,靠「授權來源網域」限制,
 // 只有你的網站能用)。到 Google Cloud Console 建立後貼在這裡;留空則備份按鈕會顯示未設定。
-export const GOOGLE_CLIENT_ID = '';
+export const GOOGLE_CLIENT_ID = '572381433742-0cscf9t5f0klpsr9vd77p0prt32i81p7.apps.googleusercontent.com';
