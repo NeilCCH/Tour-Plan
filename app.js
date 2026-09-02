@@ -12,7 +12,7 @@
 import { db, CATEGORIES, STATUSES, DEFAULT_STAY } from './db.js';
 import { geocode, geocodeCandidates, legModes, modeEstimate, orderFromStart, nearestOrder, kmeansDays, orderClusters, haversine } from './geo.js';
 
-const APP_VERSION = 'v79'; // 顯示在帳號視窗,方便確認手機跑的是哪一版
+const APP_VERSION = 'v80'; // 顯示在帳號視窗,方便確認手機跑的是哪一版
 const app = document.getElementById('app');
 const header = document.getElementById('header');
 
@@ -1581,6 +1581,7 @@ function momentBody(trip, places, moments) {
     <div class="moment-tools">
       <button class="btn ghost" id="moment-mapbtn" style="--c:#22b34a;color:#22b34a">${ic('pin')} 足跡地圖</button>
       <button class="btn ghost" id="moment-batchbtn" style="--c:#0ea5e9;color:#0ea5e9">${ic('camera')} 批次匯入照片</button>
+      <button class="btn ghost" id="moment-drivebtn" style="--c:#16a34a;color:#16a34a">☁️ 備份到 Drive</button>
       <input type="file" accept="image/*" multiple id="moment-batchfile" hidden>
     </div>
     <label class="prox-row">${ic('pin')} 靠近景點自動提示打卡<span class="chip ${proximityOn ? 'on' : ''}" id="prox-toggle">${proximityOn ? '開' : '關'}</span></label>
@@ -1634,6 +1635,20 @@ function momentBody(trip, places, moments) {
   }
   html += '</div>';
   return html;
+}
+
+// dataURL → Blob(給 Drive 備份上傳用)
+function dataUrlToBlob(dataUrl) {
+  const [head, b64] = dataUrl.split(',');
+  const mime = (head.match(/:(.*?);/) || [])[1] || 'image/jpeg';
+  const bin = atob(b64); const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return new Blob([arr], { type: mime });
+}
+// 檔名用的時間戳 YYYYMMDD-HHMM
+function photoStamp(ts) {
+  const d = new Date(ts || Date.now()); const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
 }
 
 // 取一張照片:本機優先;本機沒有但雲端有(協作者拍的)就下載並快取回本機。
@@ -1704,6 +1719,48 @@ function fillLocalAssets() {
     if (url) au.src = url; else au.closest('.m-audio')?.replaceChildren(document.createTextNode('🎤 語音存在錄製的裝置上'));
   });
 }
+// 備份照片到「使用者自己的」Google Drive(drive.file 範圍)。發起人、協作者都能各自備份看得到的照片。
+function openDriveBackup(trip, moments) {
+  const withPhoto = moments.filter((m) => m.photoId || m.photoPath);
+  openSheet(`
+    <h2>備份照片到 Google Drive</h2>
+    <p class="tip-desktop">把這趟你看得到的照片備份到<b>你自己的</b> Google Drive(資料夾:<b>旅遊App備份 / ${esc(trip.name)}</b>)。到期被雲端清掉也不怕,原圖永久留存。已備份過的會自動略過。</p>
+    <div class="meta">可備份:約 ${withPhoto.length} 張</div>
+    <div id="dv-msg" class="meta" style="min-height:1.1em;margin:.5rem 0"></div>
+    <div class="vm-progress" id="dv-progress" style="display:none"><div class="vm-bar" id="dv-bar"></div></div>
+    <div class="btn-row">
+      <button class="btn primary" id="dv-go">開始備份</button>
+      <button class="btn ghost" id="dv-cancel">關閉</button>
+    </div>
+  `, (sheet, close) => {
+    sheet.querySelector('#dv-cancel').onclick = close;
+    sheet.querySelector('#dv-go').onclick = async () => {
+      const msg = sheet.querySelector('#dv-msg'); const go = sheet.querySelector('#dv-go');
+      const prog = sheet.querySelector('#dv-progress'); const bar = sheet.querySelector('#dv-bar');
+      if (!withPhoto.length) { msg.style.color = 'var(--danger)'; msg.textContent = '這趟還沒有照片可備份。'; return; }
+      try { if (!cloudDrive) cloudDrive = await import('./drive.js'); }
+      catch (_) { msg.style.color = 'var(--danger)'; msg.textContent = '無法載入備份元件(需要網路)'; return; }
+      if (!cloudDrive.driveConfigured()) { msg.style.color = 'var(--danger)'; msg.textContent = '尚未完成 Google 設定:請把 OAuth 用戶端 ID 填進 supabase-config.js 的 GOOGLE_CLIENT_ID。'; return; }
+      go.disabled = true; msg.style.color = 'var(--text-dim)'; msg.textContent = '連線 Google…';
+      try { await cloudDrive.driveConnect(); } // 必須在點擊當下授權
+      catch (e) { msg.style.color = 'var(--danger)'; msg.textContent = 'Google 授權未完成:' + (e.message || e); go.disabled = false; return; }
+      msg.textContent = '準備照片…';
+      const items = [];
+      for (const m of withPhoto) {
+        const url = await loadMomentPhoto(m.photoId, m.photoPath);
+        if (url) items.push({ name: `${photoStamp(m.takenAt)}-${String(m.id).slice(0, 6)}.jpg`, blob: dataUrlToBlob(url) });
+      }
+      if (!items.length) { msg.style.color = 'var(--danger)'; msg.textContent = '照片都載入不到(可能不在本機也未上雲)。'; go.disabled = false; return; }
+      prog.style.display = '';
+      try {
+        const r = await cloudDrive.backupPhotos(trip.name, items, (done, total) => { bar.style.width = Math.round(done / total * 100) + '%'; msg.textContent = `備份中… ${done}/${total}`; });
+        msg.style.color = 'var(--accent)'; msg.textContent = `完成!新增 ${r.uploaded} 張、已存在略過 ${r.skipped} 張。打開 Google Drive 的「旅遊App備份」資料夾即可看到。`;
+      } catch (e) { msg.style.color = 'var(--danger)'; msg.textContent = '備份失敗:' + (e.message || e); }
+      finally { go.disabled = false; prog.style.display = 'none'; bar.style.width = '0%'; }
+    };
+  });
+}
+
 // 在指定容器畫出足跡地圖(打卡點 + 已定位景點)
 async function renderFootprintMap(box, moments, places) {
   const pts = moments.filter((m) => m.lat != null && m.lng != null);
@@ -1750,6 +1807,8 @@ function wireMomentTab(trip, places, moments) {
     const m = moments.find((x) => x.id === c.dataset.moment);
     c.addEventListener('click', () => openMomentSheet(trip, places, m));
   });
+  // 備份到 Google Drive
+  app.querySelector('#moment-drivebtn')?.addEventListener('click', () => openDriveBackup(trip, moments));
   // 批次匯入照片:一次多張,每張依檔案時間各成一則,排進時間軸
   const batchFile = app.querySelector('#moment-batchfile');
   const batchBtn = app.querySelector('#moment-batchbtn');
@@ -2607,6 +2666,7 @@ updateOnline();
 // sync.js 是「動態載入」的:萬一離線或 CDN 被擋,載入失敗也只是沒有雲端,
 // App 仍能純本地運作。
 let cloud = null;         // sync.js 模組（null = 純本地）
+let cloudDrive = null;    // drive.js 模組（Google Drive 備份,動態載入）
 let cloudUser = null;     // 目前登入者
 let cloudState = 'idle';  // idle | syncing | synced | error
 let cloudError = '';      // 最近一次同步失敗的原因(顯示在帳號視窗,方便診斷)

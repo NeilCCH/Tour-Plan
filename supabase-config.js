@@ -12,3 +12,7 @@ export const SUPABASE_URL = 'https://pwjyqxpadaadvbecrckw.supabase.co';
 
 export const SUPABASE_ANON_KEY =
   'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InB3anlxeHBhZGFhZHZiZWNyY2t3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODUzNzczMDcsImV4cCI6MjEwMDk1MzMwN30.PmWg8Charfop5-6RL0N40QsarISXTlwrlvRILJ7vIEQ';
+
+// Google Drive 備份用的 OAuth 用戶端 ID(網頁型;此值可公開,靠「授權來源網域」限制,
+// 只有你的網站能用)。到 Google Cloud Console 建立後貼在這裡;留空則備份按鈕會顯示未設定。
+export const GOOGLE_CLIENT_ID = '';
