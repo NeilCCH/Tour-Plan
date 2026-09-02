@@ -12,7 +12,7 @@
 import { db, CATEGORIES, STATUSES, DEFAULT_STAY } from './db.js';
 import { geocode, geocodeCandidates, legModes, modeEstimate, orderFromStart, nearestOrder, kmeansDays, orderClusters, haversine } from './geo.js';
 
-const APP_VERSION = 'v78'; // 顯示在帳號視窗,方便確認手機跑的是哪一版
+const APP_VERSION = 'v79'; // 顯示在帳號視窗,方便確認手機跑的是哪一版
 const app = document.getElementById('app');
 const header = document.getElementById('header');
 
@@ -1038,10 +1038,10 @@ function openTripSheet(trip = null) {
         <option value="">未設定</option>
         ${COUNTRIES.map((c) => `<option value="${c.code}" ${trip?.country === c.code ? 'selected' : ''}>${flagOf(c.code)} ${esc(c.name)}</option>`).join('')}
       </select></label>
-    ${editing && trip.ownerId === currentUser?.id ? `
-    <label class="field"><span class="lab">照片雲端保存期限(到期只刪雲端壓縮版,手機原圖保留)</span>
+    ${(!editing || trip.ownerId === currentUser?.id) ? `
+    <label class="field"><span class="lab">照片雲端保存期限(必選,沒選照片不會上傳;到期只刪雲端,手機原圖保留)</span>
       <select id="f-retain" class="select">
-        ${[[0, '永久保存(不自動刪)'], [90, '3 個月'], [180, '6 個月'], [365, '1 年']].map(([v, l]) => `<option value="${v}" ${(trip.photoRetentionDays ?? 0) === v ? 'selected' : ''}>${l}</option>`).join('')}
+        ${(() => { const cur = Number(editing ? (trip.photoRetentionDays ?? 0) : 0); return `<option value="" ${![90, 180].includes(cur) ? 'selected' : ''}>請選擇（必選才會上傳）</option><option value="90" ${cur === 90 ? 'selected' : ''}>3 個月</option><option value="180" ${cur === 180 ? 'selected' : ''}>6 個月</option>`; })()}
       </select></label>` : ''}
     <div class="btn-row">
       <button class="btn primary" id="f-save">${editing ? '儲存' : '建立旅程'}</button>
@@ -1584,6 +1584,13 @@ function momentBody(trip, places, moments) {
       <input type="file" accept="image/*" multiple id="moment-batchfile" hidden>
     </div>
     <label class="prox-row">${ic('pin')} 靠近景點自動提示打卡<span class="chip ${proximityOn ? 'on' : ''}" id="prox-toggle">${proximityOn ? '開' : '關'}</span></label>
+    ${(() => {
+      if (retentionChosen(trip) || !moments.some((m) => m.photoId)) return '';
+      const isOwner = trip.ownerId === currentUser?.id;
+      return isOwner
+        ? '<div class="retain-warn">⚠️ 照片還沒上雲。請到「編輯旅程」選擇<b>照片雲端保存期限(3 或 6 個月)</b>,選定後照片才會上傳、協作者才看得到。</div>'
+        : '<div class="retain-warn">☁️ 發起人尚未設定照片保存期限,照片目前只存在本機、還沒分享給大家。</div>';
+    })()}
     <div id="moment-map" class="mapbox" style="display:none;margin:.2rem 0 1rem"></div>`;
 
   if (!moments.length) {
@@ -1647,9 +1654,13 @@ async function loadMomentPhoto(assetId, path) {
 
 // 背景把「本機有照片、但雲端還沒上傳」的 moment 一張張上傳,並把路徑寫回(隨同步擴散給協作者)。
 // 別台裝置拍的照片(本機沒有原檔)不會由我上傳,交給原裝置處理。
+// 保存期限必須由發起人選 3 或 6 個月才算有效;沒選就不上傳。
+const retentionChosen = (trip) => [90, 180].includes(Number(trip && trip.photoRetentionDays));
 let _photoSyncing = false;
 async function syncTripPhotos(tripId) {
   if (_photoSyncing || !cloud || !cloud.uploadPhoto || !currentUser || !navigator.onLine) return;
+  const trip = await db.getTrip(tripId).catch(() => null);
+  if (!retentionChosen(trip)) return; // 發起人尚未選保存期限 → 照片不上傳
   _photoSyncing = true;
   try {
     const moments = await db.listMoments(tripId);

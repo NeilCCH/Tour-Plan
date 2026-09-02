@@ -106,7 +106,7 @@ function withFts(record, changedKeys, now) {
 }
 
 // ---- Trip ------------------------------------------------------------------
-async function createTrip({ name, startDate = '', endDate = '', people = 1, country = '', ownerId = null }) {
+async function createTrip({ name, startDate = '', endDate = '', people = 1, country = '', ownerId = null, photoRetentionDays = 0 }) {
   const now = Date.now();
   const trip = {
     id: newId(), name: (name || '未命名旅程').trim(),
@@ -116,7 +116,7 @@ async function createTrip({ name, startDate = '', endDate = '', people = 1, coun
     ownerId,                        // 這趟的擁有者(登入者 id);列表依此過濾
     members: [],                    // 協作者的 uid 清單(擁有者不列在內)
     inviteCode: '',                 // 邀請碼(產生邀請連結時才填)
-    photoRetentionDays: 365,        // 雲端照片保存天數(0=永久;到期由擁有者的 App 自動清雲端那份)
+    photoRetentionDays,             // 雲端照片保存天數:必須由發起人選 90 或 180;0=未選=不上傳
     public: false,                  // 是否開放公開分享(唯讀)
     fts: {},                        // 欄位級修改時間
     createdAt: now, updatedAt: now, deleted: false,

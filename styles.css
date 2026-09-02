@@ -430,6 +430,8 @@ input[type="date"]::-webkit-date-and-time-value { text-align: left; margin: 0; }
 .bm-back { display: flex; align-items: flex-start; gap: .7rem; }
 .bm-back .bm-thumb { width: 3.4rem; height: 3.4rem; }
 .bm-back .chip { margin-top: .4rem; }
+.retain-warn { margin: .5rem 0; padding: .6rem .8rem; border-radius: 12px; font-size: .9rem; line-height: 1.5;
+  background: color-mix(in srgb, #f59e0b 14%, var(--card)); border: 1px solid color-mix(in srgb, #f59e0b 45%, transparent); color: var(--text); }
 
 /* ---- 旅遊書 PDF 版面(白底黑字,離螢幕渲染)---- */
 /* 在畫面內(左上、藏在彈窗遮罩 z-index:30 之下)渲染,避免 html2canvas 對離畫面元素產生空白 */
