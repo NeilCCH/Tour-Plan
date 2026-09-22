@@ -12,7 +12,7 @@
 import { db, CATEGORIES, STATUSES, DEFAULT_STAY } from './db.js';
 import { geocode, geocodeCandidates, legModes, modeEstimate, orderFromStart, nearestOrder, kmeansDays, orderClusters, haversine } from './geo.js';
 
-const APP_VERSION = 'v81'; // 顯示在帳號視窗,方便確認手機跑的是哪一版
+const APP_VERSION = 'v82'; // 顯示在帳號視窗,方便確認手機跑的是哪一版
 const app = document.getElementById('app');
 const header = document.getElementById('header');
 
@@ -1922,8 +1922,8 @@ function wireBookTab(trip, places, moments) {
 }
 
 // ---- 製作旅遊書 PDF:手動挑素材 → 產生可存檔的 PDF -----------------------------
-// 產 PDF 用「把畫面拍成圖再組頁」的方式(html2pdf,執行時從 CDN 載入),
-// 這樣中文能靠瀏覽器字型正常渲染(純 jsPDF 內建字型不支援中文)。
+// 用 jsPDF + 逐頁 canvas 繪製(見 generateBookPDF):中文靠 ctx.fillText 用瀏覽器字型渲染,
+// 逐頁貼進 PDF,避免單張過大或 html2canvas 空白的問題。
 function openBookMaker(trip, places, moments) {
   const byId = new Map(places.map((p) => [p.id, p]));
   const materials = moments.filter((m) => m.photoId || m.text || m.rating || m.spend);
@@ -2056,70 +2056,6 @@ function scheduleSortedMoments(moments, places) {
     if (da !== db2) return da - db2;
     return (a.takenAt || 0) - (b.takenAt || 0);
   });
-}
-
-function pdfBookHtml(trip, places, chosen, opts, photoUrls) {
-  const byId = new Map(places.map((p) => [p.id, p]));
-  const dayCount = tripDayCount(trip, places);
-  let h = '';
-  if (opts.cover) {
-    const flag = trip.country ? flagOf(trip.country) : '';
-    h += `<section class="pb-cover"><div class="pb-flag">${flag || '🧳'}</div>
-      <h1>${esc(opts.title || trip.name)}</h1>
-      <div class="pb-sub">${esc(fmtDateRange(trip.startDate, trip.endDate))}${trip.country ? ' · ' + esc(countryName(trip.country)) : ''}</div></section>`;
-  }
-  if (opts.stats) {
-    const visited = places.filter((p) => p.status === '已造訪').length;
-    const totalSpend = chosen.reduce((s, m) => s + (Number(m.spend) || 0), 0);
-    h += `<section class="pb-stats">
-      <div><b>${dayCount}</b><span>天</span></div>
-      <div><b>${visited}</b><span>造訪地</span></div>
-      <div><b>${chosen.length}</b><span>入選點滴</span></div>
-      ${totalSpend ? `<div><b>${totalSpend.toLocaleString()}</b><span>花費</span></div>` : ''}</section>`;
-  }
-  // 依行程日程分組:用關聯景點的「天」(Day1→最後);沒關聯景點的歸「其他」放最後
-  const groups = new Map();
-  scheduleSortedMoments(chosen, places).forEach((m) => {
-    const day = (m.placeId && byId.get(m.placeId)?.assignedDay) || 0;
-    const key = day || 9999;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(m);
-  });
-  const dayKeys = [...groups.keys()].sort((a, b) => a - b);
-  for (const key of dayKeys) {
-    const list = groups.get(key);
-    const header = key === 9999 ? '其他' : `Day ${key}${trip.startDate ? ' · ' + dayDateLabel(trip.startDate, key) : ''}`;
-    h += `<section class="pb-day"><h2>${header}</h2>`;
-    for (const m of list) {
-      const place = m.placeId ? byId.get(m.placeId) : null;
-      const url = photoUrls[m.id];
-      const caps = [hhmm(m.takenAt)];
-      if (place) caps.push(esc(place.name));
-      if (m.weather) caps.push(`${wmoEmoji(m.weather.code)} ${m.weather.temp}°`);
-      if (m.rating) caps.push('★'.repeat(m.rating));
-      if (m.spend) caps.push(`${esc(m.currency || '')}${Number(m.spend).toLocaleString()}`);
-      h += `<div class="pb-item">${url ? `<img src="${url}" alt="">` : ''}
-        <div class="pb-cap">${caps.join(' · ')}</div>
-        ${m.text ? `<div class="pb-text">${esc(m.text)}</div>` : ''}</div>`;
-    }
-    h += `</section>`;
-  }
-  return h;
-}
-
-// html2pdf 是瀏覽器 UMD 函式庫,用 script 標籤載入取 window.html2pdf(比 esm 匯入穩定)
-let _html2pdfPromise = null;
-function loadHtml2pdf() {
-  if (window.html2pdf) return Promise.resolve(window.html2pdf);
-  if (_html2pdfPromise) return _html2pdfPromise;
-  _html2pdfPromise = new Promise((resolve, reject) => {
-    const s = document.createElement('script');
-    s.src = 'https://cdn.jsdelivr.net/npm/html2pdf.js@0.10.2/dist/html2pdf.bundle.min.js';
-    s.onload = () => window.html2pdf ? resolve(window.html2pdf) : reject(new Error('排版元件載入異常'));
-    s.onerror = () => reject(new Error('無法載入排版元件(需要網路)'));
-    document.head.appendChild(s);
-  });
-  return _html2pdfPromise;
 }
 
 // jsPDF UMD 載入
@@ -2279,11 +2215,6 @@ function pickVideoMime() {
   return '';
 }
 function loadImg(url) { return new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error('圖片載入失敗')); i.src = url; }); }
-function drawCover(ctx, img, W, H, scale) {
-  const s = Math.max(W / img.width, H / img.height) * scale;
-  const w = img.width * s, h = img.height * s;
-  ctx.drawImage(img, (W - w) / 2, (H - h) / 2, w, h);
-}
 // 把圖縮成很小的一張(之後放大回畫面 = 平滑模糊,不需 canvas 濾鏡,相容 iOS)
 function makeBgSmall(img) {
   const long = 72;

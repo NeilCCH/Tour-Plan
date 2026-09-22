@@ -433,23 +433,7 @@ input[type="date"]::-webkit-date-and-time-value { text-align: left; margin: 0; }
 .retain-warn { margin: .5rem 0; padding: .6rem .8rem; border-radius: 12px; font-size: .9rem; line-height: 1.5;
   background: color-mix(in srgb, #f59e0b 14%, var(--card)); border: 1px solid color-mix(in srgb, #f59e0b 45%, transparent); color: var(--text); }
 
-/* ---- 旅遊書 PDF 版面(白底黑字,離螢幕渲染)---- */
-/* 在畫面內(左上、藏在彈窗遮罩 z-index:30 之下)渲染,避免 html2canvas 對離畫面元素產生空白 */
-.pdf-book { position: absolute; left: 0; top: 0; z-index: 1; width: 794px; background: #fff; color: #111; }
-.pdf-book .pb-cover { text-align: center; padding: 60px 40px 24px; }
-.pdf-book .pb-flag { font-size: 66px; line-height: 1; }
-.pdf-book .pb-cover h1 { font-size: 30px; font-weight: 800; margin: 14px 0 6px; }
-.pdf-book .pb-sub { color: #555; font-size: 15px; }
-.pdf-book .pb-stats { display: flex; gap: 10px; padding: 6px 40px 18px; }
-.pdf-book .pb-stats > div { flex: 1; text-align: center; border: 1px solid #ddd; border-radius: 8px; padding: 8px 4px; }
-.pdf-book .pb-stats b { display: block; font-size: 20px; font-weight: 800; color: #1f6feb; }
-.pdf-book .pb-stats span { font-size: 11px; color: #666; }
-.pdf-book .pb-day { padding: 0 40px; }
-.pdf-book .pb-day h2 { font-size: 18px; font-weight: 800; border-bottom: 2px solid #1f6feb; padding-bottom: 4px; margin: 20px 0 12px; }
-.pdf-book .pb-item { margin-bottom: 16px; page-break-inside: avoid; }
-.pdf-book .pb-item img { width: 100%; border-radius: 8px; display: block; }
-.pdf-book .pb-cap { font-size: 12px; color: #666; margin-top: 6px; font-weight: 600; }
-.pdf-book .pb-text { font-size: 14px; line-height: 1.65; margin-top: 4px; white-space: pre-wrap; word-break: break-word; }
+/* 旅遊書 PDF 已改用 jsPDF + 逐頁 canvas 繪製(見 app.js generateBookPDF),不再需要離螢幕 HTML 版面 */
 
 /* ---- 按鈕 ---- */
 .btn {
