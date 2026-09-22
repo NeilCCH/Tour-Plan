@@ -12,7 +12,7 @@
 import { db, CATEGORIES, STATUSES, DEFAULT_STAY } from './db.js';
 import { geocode, geocodeCandidates, legModes, modeEstimate, orderFromStart, nearestOrder, kmeansDays, orderClusters, haversine } from './geo.js';
 
-const APP_VERSION = 'v82'; // 顯示在帳號視窗,方便確認手機跑的是哪一版
+const APP_VERSION = 'v83'; // 顯示在帳號視窗,方便確認手機跑的是哪一版
 const app = document.getElementById('app');
 const header = document.getElementById('header');
 
@@ -1712,7 +1712,12 @@ async function enforcePhotoRetention(trip) {
 function fillLocalAssets() {
   app.querySelectorAll('img[data-asset]').forEach(async (im) => {
     const url = await loadMomentPhoto(im.dataset.asset, im.dataset.path || '');
-    if (url) im.src = url; else im.closest('.m-photo')?.replaceChildren(document.createTextNode('📷 照片載入不到'));
+    if (url) { im.src = url; return; }
+    const box = im.closest('.m-photo');
+    if (!box) return;
+    box.classList.add('ph');
+    // 沒有雲端路徑=還在上傳;有路徑但抓不到=暫時性(離線/慢),都給友善說明
+    box.replaceChildren(document.createTextNode(im.dataset.path ? '📷 照片暫時載入不到,稍後再試' : '☁️ 照片上傳中,稍後就會出現'));
   });
   app.querySelectorAll('audio[data-audio]').forEach(async (au) => {
     const url = await db.getAsset(au.dataset.audio).catch(() => null);
