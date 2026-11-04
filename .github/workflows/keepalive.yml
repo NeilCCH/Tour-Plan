@@ -1,33 +1,45 @@
 name: Supabase keepalive
 
-# 免費 Supabase 專案「連續 7 天沒有任何連線」就會自動暫停。
-# 這個排程每週一、四各連一次資料庫(讀 1 筆即可),讓專案保持活躍,不會被暫停。
-# URL 與 anon key 都是公開安全的(anon key 本來就設計成公開,真正保護靠資料庫 RLS)。
-# 也可以到 repo 的 Actions 分頁手動按「Run workflow」立即執行一次。
+# 免費 Supabase 專案閒置就會被自動暫停;輕量的「讀取」可能不被算作活躍。
+# 這個排程每天對資料庫做一次「真的寫入」(心跳),是明確的資料庫活動,最能避免被暫停。
+#
+# 需要兩個一次性設定:
+#   1) 在 Supabase SQL Editor 跑最新的 supabase-schema.sql(建立 public.keepalive 表)
+#   2) 在 repo 設定一個加密 Secret:SUPABASE_SERVICE_ROLE(值=Supabase 的 service_role 金鑰)
+#      GitHub → repo → Settings → Secrets and variables → Actions → New repository secret
+#      ⚠️ service_role 是機密,只放在 GitHub Secret,不要放進程式碼或分享出去。
+# 也可到 Actions 分頁手動按「Run workflow」立即執行一次。
 
 on:
   schedule:
-    - cron: '17 2 * * 1,4'   # 每週一、四 02:17 UTC 各觸發一次(避開整點尖峰)
+    - cron: '11 20 * * *'   # 每天 UTC 20:11(台灣 04:11)寫一次心跳
   workflow_dispatch:          # 允許手動執行
 
 jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping Supabase REST（保持免費專案活躍）
+      - name: Heartbeat write to Supabase（保持免費專案活躍）
+        env:
+          KEY: ${{ secrets.SUPABASE_SERVICE_ROLE }}
         run: |
-          URL="https://pwjyqxpadaadvbecrckw.supabase.co/rest/v1/trips?select=id&limit=1"
-          KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InB3anlxeHBhZGFhZHZiZWNyY2t3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODUzNzczMDcsImV4cCI6MjEwMDk1MzMwN30.PmWg8Charfop5-6RL0N40QsarISXTlwrlvRILJ7vIEQ"
-          code=$(curl -s -o /tmp/resp.txt -w "%{http_code}" \
+          if [ -z "$KEY" ]; then
+            echo "缺少 Secret：SUPABASE_SERVICE_ROLE(請到 repo Settings → Secrets 新增)"; exit 1
+          fi
+          URL="https://pwjyqxpadaadvbecrckw.supabase.co/rest/v1/keepalive"
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          code=$(curl -s -o /tmp/resp.txt -w "%{http_code}" -X POST "$URL" \
             -H "apikey: $KEY" \
             -H "Authorization: Bearer $KEY" \
-            "$URL")
+            -H "Content-Type: application/json" \
+            -H "Prefer: resolution=merge-duplicates" \
+            -d "{\"id\":1,\"last_ping\":\"$NOW\"}")
           echo "HTTP status: $code"
           echo "Response: $(cat /tmp/resp.txt)"
-          # 2xx/4xx 都代表伺服器有回應=資料庫醒著;只有連不上(5xx/000)才算失敗
-          if [ -n "$code" ] && [ "$code" -ge 200 ] && [ "$code" -lt 500 ]; then
-            echo "OK：Supabase 有回應（$code），專案保持活躍。"
+          # 寫入成功=2xx;其餘(含連不上 000、專案暫停時 DNS 解析失敗)都算失敗
+          if [ -n "$code" ] && [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+            echo "OK：心跳已寫入,專案保持活躍。"
           else
-            echo "Ping 失敗（$code）——專案可能已暫停,請到 Supabase 後台 Restore。"
+            echo "心跳失敗（$code）——專案可能暫停中,請先到 Supabase 後台 Restore,或確認 Secret / keepalive 表已建立。"
             exit 1
           fi
