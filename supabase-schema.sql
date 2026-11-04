@@ -275,3 +275,14 @@ create policy "trip members delete photos" on storage.objects for delete to auth
       where t.id::text = (storage.foldername(name))[1]
         and (t.user_id = auth.uid() or coalesce(t.data->'members','[]'::jsonb) ? auth.uid()::text))
   );
+
+-- ===========================================================================
+-- 保活心跳表:GitHub Actions 每天用 service_role 寫入一筆(真正的資料庫活動),
+-- 讓免費專案不會因閒置被自動暫停。只給 service_role 用(它繞過 RLS);
+-- 開啟 RLS 但不加任何政策 = 擋掉 anon/authenticated,一般使用者碰不到。
+-- ===========================================================================
+create table if not exists public.keepalive (
+  id int primary key default 1,
+  last_ping timestamptz not null default now()
+);
+alter table public.keepalive enable row level security;
