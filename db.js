@@ -140,18 +140,25 @@ async function updateTrip(id, patch) {
   const next = withFts({ ...trip, ...patch }, Object.keys(patch), Date.now());
   await put('trips', next); notify(); return next;
 }
-// 刪除旅程：軟刪除，並連同底下 Place、Moment 一併軟刪除（讓刪除能同步）
+// 刪除旅程：軟刪除，並連同底下 Place、Moment 一併軟刪除（讓刪除能同步）。
+// Moment 用 tripId 找(不是每則都有關聯景點);本機的照片/語音大檔直接清掉。
+// 回傳 { photoPaths }:這趟已上雲的照片路徑,由呼叫端(有雲端連線的那層)去刪,免得佔雲端空間。
 async function deleteTrip(id) {
   const now = Date.now();
-  const places = await getByIndex('places', 'tripId', id);
-  for (const p of places) {
-    const moments = await getByIndex('moments', 'placeId', p.id);
-    for (const m of moments) await put('moments', withFts({ ...m, deleted: true }, ['deleted'], now));
-    await put('places', withFts({ ...p, deleted: true }, ['deleted'], now));
+  const photoPaths = [];
+  const moments = await getByIndex('moments', 'tripId', id);
+  for (const m of moments) {
+    if (m.photoPath) photoPaths.push(m.photoPath);
+    if (m.photoId) await del('assets', m.photoId).catch(() => {});
+    if (m.audioId) await del('assets', m.audioId).catch(() => {});
+    if (!m.deleted) await put('moments', withFts({ ...m, deleted: true }, ['deleted'], now));
   }
+  const places = await getByIndex('places', 'tripId', id);
+  for (const p of places) if (!p.deleted) await put('places', withFts({ ...p, deleted: true }, ['deleted'], now));
   const trip = await get('trips', id);
   if (trip) await put('trips', withFts({ ...trip, deleted: true }, ['deleted'], now));
   notify();
+  return { photoPaths };
 }
 
 // ---- Place -----------------------------------------------------------------
@@ -185,7 +192,8 @@ async function createPlace(tripId, data) {
   await put('places', place); notify(); return place;
 }
 
-// 設定/取消整趟公開分享:連同底下地點、Moment 一起標記(供權限判斷)
+// 設定/取消整趟公開分享:連同底下「地點」一起標記(供權限判斷)。
+// 旅途記錄(Moment:日記文字、花費、打卡座標)一律不公開——分享頁只顯示行程,不該連日記一起外流。
 async function setTripPublic(tripId, isPublic) {
   const now = Date.now();
   const flag = !!isPublic;
@@ -193,11 +201,7 @@ async function setTripPublic(tripId, isPublic) {
   if (!trip) return;
   await put('trips', withFts({ ...trip, public: flag }, ['public'], now));
   const places = await getByIndex('places', 'tripId', tripId);
-  for (const p of places) {
-    await put('places', withFts({ ...p, public: flag }, ['public'], now));
-    const moments = await getByIndex('moments', 'placeId', p.id);
-    for (const m of moments) await put('moments', withFts({ ...m, public: flag }, ['public'], now));
-  }
+  for (const p of places) await put('places', withFts({ ...p, public: flag }, ['public'], now));
   notify();
 }
 async function listPlaces(tripId) {
@@ -213,10 +217,12 @@ async function updatePlace(id, patch) {
   const next = withFts({ ...place, ...patch }, Object.keys(patch), Date.now());
   await put('places', next); notify(); return next;
 }
+// 刪除地點:只刪「規劃」裡的這個點。關聯到它的旅途記錄(照片/日記)保留,改為「不關聯景點」,
+// 不會因為整理行程而連帶弄丟回憶。
 async function deletePlace(id) {
   const now = Date.now();
   const moments = await getByIndex('moments', 'placeId', id);
-  for (const m of moments) await put('moments', withFts({ ...m, deleted: true }, ['deleted'], now));
+  for (const m of moments) if (!m.deleted) await put('moments', withFts({ ...m, placeId: null }, ['placeId'], now));
   const place = await get('places', id);
   if (place) await put('places', withFts({ ...place, deleted: true }, ['deleted'], now));
   notify();
@@ -226,7 +232,6 @@ async function deletePlace(id) {
 // 一筆記錄可同時有文字、照片、星等、花費、座標;photoId 指向本機 assets(不同步)。
 async function createMoment(tripId, data = {}) {
   const now = Date.now();
-  const parent = await get('trips', tripId);
   const moment = {
     id: newId(), tripId,
     placeId: data.placeId || null,     // 關聯的景點(可無)
@@ -244,7 +249,7 @@ async function createMoment(tripId, data = {}) {
     authorId: data.authorId || null,   // 誰記的(旅伴動態牆顯示用)
     authorName: data.authorName || '', // 記錄當下的暱稱快照
     takenAt: data.takenAt || now,      // 這則的時間(照片可用檔案時間)
-    public: !!parent?.public,          // 沿用旅程公開狀態
+    public: false,                     // 旅途記錄一律不公開(分享頁只給行程)
     fts: {}, createdAt: now, updatedAt: now, deleted: false,
   };
   await put('moments', moment); notify(); return moment;
@@ -285,6 +290,9 @@ async function getAsset(id) {
   const a = await get('assets', id);
   return a?.dataUrl || null;
 }
+async function deleteAsset(id) {
+  if (id) await del('assets', id).catch(() => {});
+}
 
 // ---- 一次性資料轉換 --------------------------------------------------------
 // 舊資料把分類「餐廳」改名為「美食」。可重複執行(改完就沒有符合的,等於空跑)。
@@ -299,6 +307,21 @@ async function migrateCategories() {
   }
   if (changed) notify();
   return changed;
+}
+
+// 一次性修復:舊版開啟「公開分享」時會把旅途記錄也標成公開;全部改回不公開(會同步上雲)。
+// 只動「我擁有或我是協作成員」的行程(別人的資料我沒有寫入權限,改了反而會讓同步失敗)。
+async function unpublishMoments(userId) {
+  if (!userId) return 0;
+  const now = Date.now();
+  const mine = new Set((await getAll('trips'))
+    .filter((t) => t.ownerId === userId || (t.members || []).includes(userId)).map((t) => t.id));
+  let n = 0;
+  for (const m of await getAll('moments')) {
+    if (m.public && mine.has(m.tripId)) { await put('moments', withFts({ ...m, public: false }, ['public'], now)); n++; }
+  }
+  if (n) notify();
+  return n;
 }
 
 // 一次性修復:把「沒有擁有者」的本地行程認領為目前使用者(不動 updatedAt,
@@ -326,7 +349,7 @@ export const db = {
   createTrip, listTrips, getTrip, updateTrip, deleteTrip, setTripPublic,
   createPlace, listPlaces, getPlace, updatePlace, deletePlace,
   createMoment, listMoments, updateMoment, deleteMoment,
-  putAsset, putAssetWithId, getAsset,
-  migrateCategories, claimOwnerlessTrips,
+  putAsset, putAssetWithId, getAsset, deleteAsset,
+  migrateCategories, claimOwnerlessTrips, unpublishMoments,
   _sync: sync,
 };

@@ -350,6 +350,8 @@ input[type="date"]::-webkit-date-and-time-value { text-align: left; margin: 0; }
   box-shadow: var(--shadow); overflow: hidden; margin-bottom: .7rem; cursor: pointer; }
 .moment-card:active { transform: scale(.99); }
 .moment-card .m-photo img { width: 100%; display: block; max-height: 60vh; object-fit: cover; }
+/* 還沒載入的照片先佔個高度:捲到附近才載入的機制才分得出「在不在畫面附近」,載入時版面也不會大跳動 */
+.moment-card .m-photo img:not([src]) { min-height: 200px; background: color-mix(in srgb, var(--accent) 6%, var(--card)); }
 .moment-card .m-photo.ph { padding: 1.4rem; text-align: center; color: var(--text-dim); background: color-mix(in srgb, var(--accent) 6%, var(--card)); }
 .moment-card .m-audio { padding: .1rem 0; }
 .moment-card .m-audio audio { width: 100%; }

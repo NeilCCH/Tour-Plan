@@ -24,20 +24,26 @@ export const updatePassword = (newPassword) => supabase.auth.updateUser({ passwo
 // ---- 狀態回報(讓畫面顯示「同步中/已同步/錯誤」)-----------------------------
 let statusCb = null;
 export function onStatus(fn) { statusCb = fn; }
-function setStatus(s) { try { statusCb && statusCb(s); } catch (_) {} }
+function setStatus(s, changed) { try { statusCb && statusCb(s, changed); } catch (_) {} }
 
 // ---- 帳號 ------------------------------------------------------------------
 export async function currentUser() {
   const { data } = await supabase.auth.getUser();
   return data?.user || null;
 }
-// ---- 公開分享:不需登入,靠 RLS 的「公開可讀」規則取得唯讀資料 ----------------
+// ---- 公開分享:不需登入的唯讀資料 --------------------------------------------
+// 優先走後端函式 public_trip / public_places:它們只回傳「已公開」的行程,並拿掉邀請碼、
+// 成員名單等不該外流的欄位。資料庫還沒跑新版 schema(函式不存在)時,退回舊的直接讀表。
 export async function fetchPublicTrip(id) {
+  const viaFn = await supabase.rpc('public_trip', { p_id: id });
+  if (!viaFn.error) return viaFn.data ? { ...viaFn.data, id } : null;
   const { data, error } = await supabase.from('trips').select('id,data').eq('id', id).maybeSingle();
   if (error || !data) return null;
   return { ...(data.data || {}), id: data.id };
 }
 export async function fetchPublicPlaces(tripId) {
+  const viaFn = await supabase.rpc('public_places', { p_trip: tripId });
+  if (!viaFn.error) return (viaFn.data || []).filter((p) => p && !p.deleted);
   const { data, error } = await supabase.from('places').select('id,data').filter('data->>tripId', 'eq', tripId);
   if (error || !data) return [];
   return data.map((r) => ({ ...(r.data || {}), id: r.id })).filter((p) => !p.deleted);
@@ -126,11 +132,16 @@ export async function downloadPhoto(path) {
   });
 }
 
-// 刪除雲端照片(刪記錄時清理,失敗不致命)
-export async function deletePhoto(path) {
-  if (!path) return;
-  try { await supabase.storage.from(PHOTO_BUCKET).remove([path]); } catch (_) {}
+// 刪除雲端照片。回傳是否成功(supabase-js 失敗時不丟例外,而是回傳 error,要自己檢查)。
+export async function deletePhotos(paths) {
+  const list = (paths || []).filter(Boolean);
+  if (!list.length) return true;
+  try {
+    const { error } = await supabase.storage.from(PHOTO_BUCKET).remove(list);
+    return !error;
+  } catch (_) { return false; }
 }
+export const deletePhoto = (path) => deletePhotos([path]);
 
 // ---- 雲端 <-> 本地 資料形狀轉換 ----------------------------------------------
 // 雲端每張表欄位:id(uuid) / user_id / data(jsonb=整筆本地物件) / updated_at / deleted
@@ -175,16 +186,17 @@ async function syncTable(table) {
   const ids = new Set([...cloudMap.keys(), ...localMap.keys()]);
 
   const toPush = [];
+  let localChanged = 0; // 這輪從雲端寫進本機的筆數(>0 畫面才需要重繪)
   for (const id of ids) {
     const c = cloudMap.get(id);
     const l = localMap.get(id);
     if (c && l) {
       const r = fromCloud(c);              // 雲端記錄(已含權威 ownerId)
       const merged = fieldMerge(l, r);     // 逐欄位合併
-      if (!sameData(merged, l)) await db._sync.putRaw(table, merged); // 本地有變 → 寫回
+      if (!sameData(merged, l)) { await db._sync.putRaw(table, merged); localChanged++; } // 本地有變 → 寫回
       if (!sameData(merged, r)) toPush.push(toCloud(merged));         // 雲端有差 → 推上去
     } else if (c && !l) {
-      await db._sync.putRaw(table, fromCloud(c));                // 只有雲端有 → 拉下來
+      await db._sync.putRaw(table, fromCloud(c)); localChanged++; // 只有雲端有 → 拉下來
     } else if (l && !c) {
       toPush.push(toCloud(l));                                   // 只有本地有 → 推上去
     }
@@ -194,24 +206,33 @@ async function syncTable(table) {
     const { error: upErr } = await supabase.from(table).upsert(toPush);
     if (upErr) throw upErr;
   }
-  return { pulled: cloudRows.length, pushed: toPush.length };
+  return { pulled: cloudRows.length, pushed: toPush.length, localChanged };
 }
 
 // ---- 整體同步 --------------------------------------------------------------
 let syncing = false;
+let syncAgain = false; // 同步進行中又有人要求同步 → 這輪結束後再跑一輪,避免漏推剛發生的變動
 export async function fullSync() {
-  const user = await currentUser();
-  if (!user || syncing) return;
+  const { data } = await supabase.auth.getSession(); // 讀本機登入狀態,不必每次同步都多打一次網路
+  if (!data?.session?.user) return;
+  if (syncing) { syncAgain = true; return; }
   syncing = true; setStatus('syncing');
+  let changed = false;
   try {
-    for (const table of db._sync.stores) await syncTable(table);
-    setStatus('synced');
+    do {
+      syncAgain = false;
+      for (const table of db._sync.stores) {
+        const r = await syncTable(table);
+        if (r.localChanged) changed = true;
+      }
+    } while (syncAgain);
+    setStatus('synced', changed); // changed=這次有從雲端拉到新東西(畫面才需要重繪)
   } catch (e) {
     console.error('雲端同步失敗:', e);
     setStatus('error:' + (e?.message || e));
     throw e;
   } finally {
-    syncing = false;
+    syncing = false; syncAgain = false;
   }
 }
 

@@ -12,7 +12,7 @@
 import { db, CATEGORIES, STATUSES, DEFAULT_STAY } from './db.js';
 import { geocode, geocodeCandidates, legModes, modeEstimate, orderFromStart, nearestOrder, kmeansDays, orderClusters, haversine } from './geo.js';
 
-const APP_VERSION = 'v83'; // 顯示在帳號視窗,方便確認手機跑的是哪一版
+const APP_VERSION = 'v84'; // 顯示在帳號視窗,方便確認手機跑的是哪一版
 const app = document.getElementById('app');
 const header = document.getElementById('header');
 
@@ -206,7 +206,7 @@ function ensureTripPresence(tripId) {
   leaveTripPresence();
   joinedTripId = tripId; presencePeers = []; editingBy = {};
   cloud.joinTripChannel(tripId, { id: currentUser.id, nickname: displayName() }, {
-    onChanged: () => { cloud.fullSync().then(() => render()).catch(() => {}); },
+    onChanged: () => { cloud.fullSync().catch(() => {}); }, // 有拉到新資料時,同步完成的回呼會重繪
     onPresence: (state) => {
       const peers = [], ids = new Set();
       Object.values(state || {}).forEach((arr) => arr.forEach((p) => {
@@ -215,14 +215,14 @@ function ensureTripPresence(tripId) {
       }));
       presencePeers = peers;
       for (const uid of Object.keys(editingBy)) if (!ids.has(uid)) delete editingBy[uid]; // 離線者清掉編輯中
-      render();
+      liveRender();
     },
     onEditing: (p) => {
       if (!p || p.id === currentUser.id) return;
       markSeen(tripId, p.id);
       if (p.placeId) editingBy[p.id] = { placeId: p.placeId, nickname: p.nickname };
       else delete editingBy[p.id];
-      render();
+      liveRender();
     },
   });
 }
@@ -250,6 +250,14 @@ function timeAgo(ts) {
   const d = Math.floor(h / 24); if (d < 30) return `${d} 天前`;
   const mo = Math.floor(d / 30); if (mo < 12) return `${mo} 個月前`;
   return `${Math.floor(mo / 12)} 年前`;
+}
+
+// 背景事件(同步完成、協作者上線/編輯)引發的重繪:使用者正在頁面上的輸入框操作時先不打斷
+// (整頁重繪會把輸入框換掉,iOS 的時間選擇器會被關掉)。使用者自己操作引發的重繪仍用 render()。
+function liveRender() {
+  const el = document.activeElement;
+  if (el && app.contains(el) && /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) return;
+  render();
 }
 
 async function render() {
@@ -1068,7 +1076,8 @@ function openTripSheet(trip = null) {
     const delBtn = editing ? sheet.querySelector('#f-del') : null; // 只有發起人有這顆
     if (delBtn) delBtn.onclick = async () => {
       if (!confirm(`確定刪除「${trip.name}」？底下所有地點與記錄都會一起刪除，無法復原。`)) return;
-      await db.deleteTrip(trip.id);
+      const { photoPaths } = await db.deleteTrip(trip.id);
+      if (photoPaths.length && cloud && cloud.deletePhotos) cloud.deletePhotos(photoPaths).catch(() => {}); // 清雲端照片,釋出空間
       close(); location.hash = '';
     };
   });
@@ -1446,7 +1455,7 @@ function openPlaceSheet(tripId, place = null) {
       close(); render();
     };
     if (editing) sheet.querySelector('#f-del').onclick = async () => {
-      if (!confirm(`確定刪除「${place.name}」？`)) return;
+      if (!confirm(`確定刪除「${place.name}」？\n(關聯到它的旅途記錄與照片會保留,只是不再關聯這個地點)`)) return;
       await db.deletePlace(place.id);
       close(); render();
     };
@@ -1610,7 +1619,7 @@ function momentBody(trip, places, moments) {
     if (k !== curKey) { curKey = k; html += `<div class="tl-day">${dayLabel(m.takenAt)}</div>`; }
     const place = m.placeId ? byId.get(m.placeId) : null;
     const photo = m.photoId
-      ? `<div class="m-photo"><img data-asset="${esc(m.photoId)}" data-path="${esc(m.photoPath || '')}" alt="旅途照片"></div>`
+      ? `<div class="m-photo"><img data-asset="${esc(m.photoId)}" data-path="${esc(m.photoPath || '')}"${photoExpired(m) ? ' data-expired="1"' : ''} alt="旅途照片"></div>`
       : (m.hasPhoto ? '<div class="m-photo ph">📷 照片存在拍攝的裝置上</div>' : '');
     const audio = m.audioId
       ? `<div class="m-audio"><audio data-audio="${esc(m.audioId)}" controls preload="none"></audio></div>`
@@ -1671,6 +1680,11 @@ async function loadMomentPhoto(assetId, path) {
 // 別台裝置拍的照片(本機沒有原檔)不會由我上傳,交給原裝置處理。
 // 保存期限必須由發起人選 3 或 6 個月才算有效;沒選就不上傳。
 const retentionChosen = (trip) => [90, 180].includes(Number(trip && trip.photoRetentionDays));
+// 這張照片「上傳到雲端」的時間。保存期限從上傳那天起算(不是拍攝日),所以補傳舊照片也能分享滿整個期限。
+// 新資料記在 photoUploadedAt;舊資料沒有這欄,用「photoPath 欄位被寫入的時間」推回。
+const photoUploadedAt = (m) => Number(m.photoUploadedAt) || (m.photoPath ? Number(m.fts?.photoPath) || 0 : 0);
+// 「上傳過、期限到了已從雲端清掉」:有上傳時間但已無雲端路徑。這種照片不可以再自動上傳。
+const photoExpired = (m) => !!m.photoId && !m.photoPath && !!Number(m.photoUploadedAt);
 let _photoSyncing = false;
 async function syncTripPhotos(tripId) {
   if (_photoSyncing || !cloud || !cloud.uploadPhoto || !currentUser || !navigator.onLine) return;
@@ -1680,44 +1694,78 @@ async function syncTripPhotos(tripId) {
   try {
     const moments = await db.listMoments(tripId);
     for (const m of moments) {
-      if (!m.photoId || m.photoPath) continue;
+      if (!m.photoId || m.photoPath || photoExpired(m)) continue; // 已上雲,或已到期清掉 → 不重傳
       const dataUrl = await db.getAsset(m.photoId).catch(() => null);
       if (!dataUrl) continue; // 照片不在本機 → 不是我上傳的責任
       try {
         const path = await cloud.uploadPhoto(tripId, m.id, m.photoId, dataUrl);
-        await db.updateMoment(m.id, { photoPath: path }); // 觸發同步,協作者才收得到
+        await db.updateMoment(m.id, { photoPath: path, photoUploadedAt: Date.now() }); // 觸發同步,協作者才收得到
       } catch (_) { /* 稍後(下次進頁/上線)再試 */ }
     }
   } finally { _photoSyncing = false; }
 }
 
-// 照片保存期限:只有擁有者的 App 執行,把超過期限的「雲端」照片刪掉(手機原圖不動),並清掉 photoPath。
+// 照片保存期限:只有擁有者的 App 執行,把「上傳超過期限」的雲端照片刪掉(手機原圖不動),並清掉 photoPath。
+// 保留 photoUploadedAt 當作「已到期」記號,syncTripPhotos 看到就不會再把它傳回去。
 async function enforcePhotoRetention(trip) {
-  const days = Number(trip.photoRetentionDays) || 0;
-  if (!days || !cloud || !cloud.deletePhoto || !currentUser || !navigator.onLine) return;
+  if (!retentionChosen(trip) || !cloud || !cloud.deletePhoto || !currentUser || !navigator.onLine) return;
   if (trip.ownerId !== currentUser.id) return; // 僅擁有者可清共享照片
-  const cutoff = Date.now() - days * 86400000;
+  const cutoff = Date.now() - Number(trip.photoRetentionDays) * 86400000;
   const moments = await db.listMoments(trip.id);
   for (const m of moments) {
     if (!m.photoPath) continue;
-    if ((m.takenAt || m.createdAt || 0) >= cutoff) continue; // 未到期
-    try {
-      await cloud.deletePhoto(m.photoPath);
-      await db.updateMoment(m.id, { photoPath: '' }); // 清路徑 → 協作者端不再嘗試下載
-    } catch (_) { /* 下次再試 */ }
+    const up = photoUploadedAt(m) || m.takenAt || m.createdAt || 1;
+    if (up >= cutoff) continue; // 未到期
+    const ok = await cloud.deletePhoto(m.photoPath).catch(() => false);
+    if (!ok) continue; // 沒刪成功就別清路徑,否則雲端會留下沒人知道的孤兒檔;下次再試
+    await db.updateMoment(m.id, { photoPath: '', photoUploadedAt: up }).catch(() => {});
   }
 }
 
+// 顯示用的照片網址快取(photoId → blob 網址)。畫面常整頁重繪(同步完成、協作者上線…),
+// 有快取就不必每次都從資料庫重讀、重解一大串 base64;超過上限就丟掉最舊的。
+const _photoUrlCache = new Map();
+const PHOTO_CACHE_MAX = 80;
+async function photoDisplayUrl(assetId, path) {
+  if (assetId && _photoUrlCache.has(assetId)) return _photoUrlCache.get(assetId);
+  const dataUrl = await loadMomentPhoto(assetId, path);
+  if (!dataUrl || !assetId) return dataUrl;
+  let url = dataUrl;
+  try { url = URL.createObjectURL(dataUrlToBlob(dataUrl)); } catch (_) { return dataUrl; }
+  _photoUrlCache.set(assetId, url);
+  if (_photoUrlCache.size > PHOTO_CACHE_MAX) {
+    const oldest = _photoUrlCache.keys().next().value;
+    URL.revokeObjectURL(_photoUrlCache.get(oldest)); _photoUrlCache.delete(oldest);
+  }
+  return url;
+}
+
 // 非同步把照片/語音塞進畫面。照片:本機沒有就從雲端抓(協作者也看得到);語音只存本機。
+// 照片捲到附近才載入(一趟幾十上百張時,不會一進頁就全部讀進記憶體)。
+let _photoObserver = null;
 function fillLocalAssets() {
-  app.querySelectorAll('img[data-asset]').forEach(async (im) => {
-    const url = await loadMomentPhoto(im.dataset.asset, im.dataset.path || '');
+  const load = async (im) => {
+    const url = await photoDisplayUrl(im.dataset.asset, im.dataset.path || '');
     if (url) { im.src = url; return; }
     const box = im.closest('.m-photo');
     if (!box) return;
     box.classList.add('ph');
-    // 沒有雲端路徑=還在上傳;有路徑但抓不到=暫時性(離線/慢),都給友善說明
-    box.replaceChildren(document.createTextNode(im.dataset.path ? '📷 照片暫時載入不到,稍後再試' : '☁️ 照片上傳中,稍後就會出現'));
+    // 到期=雲端那份已清掉;沒有雲端路徑=還在上傳;有路徑但抓不到=暫時性(離線/慢)
+    const msg = im.dataset.expired ? '📷 雲端保存期限已過,照片只留在拍攝者的裝置'
+      : (im.dataset.path ? '📷 照片暫時載入不到,稍後再試' : '☁️ 照片上傳中,稍後就會出現');
+    box.replaceChildren(document.createTextNode(msg));
+  };
+  if (_photoObserver) { _photoObserver.disconnect(); _photoObserver = null; }
+  if ('IntersectionObserver' in window) {
+    _photoObserver = new IntersectionObserver((entries, obs) => {
+      for (const e of entries) if (e.isIntersecting) { obs.unobserve(e.target); load(e.target); }
+    }, { rootMargin: '800px 0px' });
+  }
+  app.querySelectorAll('img[data-asset]').forEach((im) => {
+    const cached = _photoUrlCache.get(im.dataset.asset);
+    if (cached) im.src = cached;                 // 看過的直接顯示,重繪不閃
+    else if (_photoObserver) _photoObserver.observe(im);
+    else load(im);
   });
   app.querySelectorAll('audio[data-audio]').forEach(async (au) => {
     const url = await db.getAsset(au.dataset.audio).catch(() => null);
@@ -2483,7 +2531,7 @@ function openMomentSheet(trip, places, moment = null, prefill = null) {
     const locMsg = sheet.querySelector('#m-locmsg');
     const placeSel = sheet.querySelector('#m-place');
     // 既有照片/語音先顯示
-    if (editing && moment.photoId) db.getAsset(moment.photoId).then((u) => { if (u) preview.innerHTML = `<img src="${u}" alt="">`; });
+    if (editing && moment.photoId) loadMomentPhoto(moment.photoId, moment.photoPath).then((u) => { if (u) preview.innerHTML = `<img src="${u}" alt="">`; });
     if (editing && moment.audioId) db.getAsset(moment.audioId).then((u) => { if (u) audioPrev.innerHTML = `<audio controls src="${u}"></audio>`; });
 
     // 語音錄音(MediaRecorder;iOS 14.5+ 支援,存本機)
@@ -2575,8 +2623,15 @@ function openMomentSheet(trip, places, moment = null, prefill = null) {
         lng: coords ? coords.lng : (editing ? moment.lng : null),
         photoId, hasPhoto: !!photoId, audioId, hasAudio: !!audioId, takenAt,
       };
+      // 換了新照片:舊的雲端路徑作廢,新照片才會重新上傳(否則協作者永遠看到舊那張)
+      if (pendingDataUrl) { patch.photoPath = ''; patch.photoUploadedAt = 0; }
       if (editing) await db.updateMoment(moment.id, patch);
       else await db.createMoment(trip.id, { ...patch, authorId: currentUser?.id, authorName: displayName() });
+      if (editing && pendingDataUrl && hadPhoto) {            // 被換掉的舊照片:雲端、本機都清掉
+        if (moment.photoPath && cloud && cloud.deletePhoto) cloud.deletePhoto(moment.photoPath).catch(() => {});
+        db.deleteAsset(moment.photoId);
+      }
+      if (editing && pendingAudioUrl && hadAudio) db.deleteAsset(moment.audioId);
       if (placeId) await db.updatePlace(placeId, { status: '已造訪' }); // 關聯景點自動標為已造訪
       close(); render();
     };
@@ -2673,12 +2728,18 @@ function updateAcct() {
 
 // 更新登入者(供把關與依使用者過濾),並記到 localStorage 讓重開/離線也記得
 function setAuthUser(user, event) {
+  const sameUser = !!(user && cloudUser && user.id === cloudUser.id);
   cloudUser = user;
   if (event === 'PASSWORD_RECOVERY') { setTimeout(openResetPasswordSheet, 100); } // 忘記密碼回連
+  if (sameUser) return; // 同一人(權杖自動更新等):畫面、暱稱、邀請都不用重抓
   if (user) {
     currentUser = { id: user.id, email: user.email || '' };
     localStorage.setItem('authUserId', user.id);
     localStorage.setItem('authUserEmail', user.email || '');
+    // 一次性修復:舊版公開分享會連旅途記錄一起標成公開,改回不公開
+    if (!localStorage.getItem('momentsUnpublished1')) {
+      db.unpublishMoments(user.id).then(() => localStorage.setItem('momentsUnpublished1', '1')).catch(() => {});
+    }
     // 一次性修復:認領缺少擁有者標記的舊行程(避免更新後行程看似消失)
     if (!localStorage.getItem('ownerRepairDone2')) {
       localStorage.setItem('ownerRepairDone2', '1');
@@ -2740,9 +2801,10 @@ async function initCloud() {
     console.warn('雲端模組載入失敗,以純本地模式運作', e);
     cloud = null; updateAcct(); return;
   }
-  cloud.onStatus((s) => {
+  cloud.onStatus((s, changed) => {
     if (s === 'syncing') cloudState = 'syncing';
-    else if (s === 'synced') { cloudState = 'synced'; cloudError = ''; render(); }
+    // 只有這次同步真的從雲端拉到新東西才重繪;單純把本機變動推上去,畫面本來就是最新的
+    else if (s === 'synced') { cloudState = 'synced'; cloudError = ''; if (changed) liveRender(); }
     else if (s && s.startsWith('error')) { cloudState = 'error'; cloudError = s.slice(6); }
     updateAcct();
   });
@@ -2794,7 +2856,7 @@ function openAuthSheet() {
           <button type="button" class="btn ghost" id="a-nicksave" style="width:auto;padding:.6rem 1rem">儲存</button>
         </div></label>
       <div class="section-title" style="margin-top:.4rem">備份與還原</div>
-      <p class="meta" style="margin-bottom:.5rem">文字類資料已在雲端;照片/語音只存本機,建議測試前先匯出一份到「檔案」App / iCloud。</p>
+      <p class="meta" style="margin-bottom:.5rem">行程與記錄已在雲端;照片只在選了保存期限的旅程才上雲(到期會清),語音只存本機。重要的建議匯出一份到「檔案」App / iCloud。</p>
       <input type="file" accept="application/json,.json" id="a-restorefile" hidden>
       <div style="display:flex;gap:.5rem;margin-bottom:1rem">
         <button type="button" class="btn ghost" id="a-backup" style="flex:1;--c:#0ea5e9;color:#0ea5e9">${ic('suitcase')} 匯出備份</button>
@@ -2900,6 +2962,8 @@ function openAuthSheet() {
 window.addEventListener('hashchange', render);
 header.querySelector('.back').addEventListener('click', () => { location.hash = ''; });
 db.migrateCategories().catch(() => {}).finally(render); // 舊資料「餐廳」→「美食」後再繪製
+// 請瀏覽器把本機資料列為「持久保存」:儲存空間吃緊時比較不會被系統自動清掉(照片原檔只在本機)
+try { navigator.storage?.persist?.().catch(() => {}); } catch (_) {}
 initCloud();
 
 // ---- Service Worker + 自動更新 --------------------------------------------

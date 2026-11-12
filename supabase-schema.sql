@@ -55,21 +55,42 @@ grant all on public.places  to authenticated;
 grant all on public.moments to authenticated;
 
 -- ===========================================================================
--- 公開分享(唯讀):允許「未登入的人」讀取被標為 public 的資料。
--- 開啟某趟「公開分享」時,App 會把該趟與其地點的 data.public 設為 true;
--- 下面的規則讓匿名者只能讀到這些被公開的列,其餘一律讀不到。
+-- 公開分享(唯讀):未登入的人「不能」直接讀資料表,只能透過下面兩個函式拿到公開行程。
+--
+-- 為什麼不再開放直接讀表:整列 data 裡除了行程內容,還有邀請碼(inviteCode)與成員名單。
+-- 以前拿到公開連結的人讀得到邀請碼,就能用它把自己加成「可編輯」的協作者;
+-- 旅途記錄(日記、花費、打卡座標)也會被一起讀走。現在:
+--   - public_trip   只回傳「已開啟公開分享」那一趟,並拿掉邀請碼 / 成員 / 擁有者等欄位
+--   - public_places 只回傳該公開行程底下的地點
+--   - 旅途記錄(moments)完全不對外
 -- ===========================================================================
-grant select on public.trips   to anon;
-grant select on public.places  to anon;
-grant select on public.moments to anon;
-
 drop policy if exists "public read trips"   on public.trips;
 drop policy if exists "public read places"  on public.places;
 drop policy if exists "public read moments" on public.moments;
+revoke all on public.trips   from anon;
+revoke all on public.places  from anon;
+revoke all on public.moments from anon;
 
-create policy "public read trips"   on public.trips   for select using ((data->>'public')::boolean is true);
-create policy "public read places"  on public.places  for select using ((data->>'public')::boolean is true);
-create policy "public read moments" on public.moments for select using ((data->>'public')::boolean is true);
+create or replace function public.public_trip(p_id uuid)
+returns jsonb language sql stable security definer set search_path = public as $$
+  select (t.data - 'inviteCode' - 'members' - 'ownerId' - 'fts') || jsonb_build_object('id', t.id)
+    from public.trips t
+   where t.id = p_id and not t.deleted and (t.data->>'public') = 'true';
+$$;
+
+create or replace function public.public_places(p_trip uuid)
+returns setof jsonb language sql stable security definer set search_path = public as $$
+  select (p.data - 'fts') || jsonb_build_object('id', p.id)
+    from public.places p
+   where p.data->>'tripId' = p_trip::text and not p.deleted
+     and exists (select 1 from public.trips t
+                  where t.id = p_trip and not t.deleted and (t.data->>'public') = 'true');
+$$;
+
+revoke all on function public.public_trip(uuid)   from public;
+revoke all on function public.public_places(uuid) from public;
+grant execute on function public.public_trip(uuid)   to anon, authenticated;
+grant execute on function public.public_places(uuid) to anon, authenticated;
 
 -- ===========================================================================
 -- 邀請協作(共同編輯):協作者的 uid 存在 trips.data.members 陣列。
@@ -158,16 +179,26 @@ create table if not exists public.invitations (
   created_at bigint not null default 0
 );
 alter table public.invitations enable row level security;
-grant select, insert, update on public.invitations to authenticated;
+-- 更新只開放 status 一欄(接受/拒絕)。不能讓人把收到的邀請改指向別的行程或別的邀請人。
+revoke all on public.invitations from anon;
+revoke update on public.invitations from authenticated;
+grant select, insert on public.invitations to authenticated;
+grant update (status) on public.invitations to authenticated;
 
 -- 讀:邀請人或被邀請人可看
 drop policy if exists "read invites" on public.invitations;
 create policy "read invites" on public.invitations for select
   using (inviter_id = auth.uid() or invitee_id = auth.uid());
--- 建立:只能以自己為邀請人
+-- 建立:只能以自己為邀請人,而且自己必須是那趟的擁有者或協作成員。
+-- (少了後半句的話,任何登入者只要知道行程 id,就能「自己邀請自己」再接受,混進別人的行程。)
 drop policy if exists "create invites" on public.invitations;
 create policy "create invites" on public.invitations for insert
-  with check (inviter_id = auth.uid());
+  with check (
+    inviter_id = auth.uid()
+    and exists (select 1 from public.trips t
+      where t.id = trip_id and not t.deleted
+        and (t.user_id = auth.uid() or coalesce(t.data->'members','[]'::jsonb) ? auth.uid()::text))
+  );
 -- 更新:邀請人或被邀請人可改(接受/拒絕/取消)
 drop policy if exists "update invites" on public.invitations;
 create policy "update invites" on public.invitations for update
@@ -180,8 +211,13 @@ returns uuid language plpgsql security definer set search_path = public as $$
 declare v_trip uuid;
 begin
   if auth.uid() is null then raise exception 'not authenticated'; end if;
-  select trip_id into v_trip from public.invitations
-   where id = p_invite and invitee_id = auth.uid() and status = 'pending';
+  -- 邀請必須是發給我的、還沒處理,而且「邀請人現在仍有權限」(是那趟的擁有者或成員)
+  select i.trip_id into v_trip
+    from public.invitations i
+    join public.trips t on t.id = i.trip_id
+   where i.id = p_invite and i.invitee_id = auth.uid() and i.status = 'pending'
+     and not t.deleted
+     and (t.user_id = i.inviter_id or coalesce(t.data->'members','[]'::jsonb) ? i.inviter_id::text);
   if v_trip is null then raise exception 'invite not found'; end if;
   update public.trips
      set data = jsonb_set(
@@ -286,3 +322,7 @@ create table if not exists public.keepalive (
   last_ping timestamptz not null default now()
 );
 alter table public.keepalive enable row level security;
+
+
+-- 讓 API 立刻認得上面新增/修改的函式(Supabase 平常會自動做,這行是保險)
+notify pgrst, 'reload schema';

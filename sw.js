@@ -8,7 +8,7 @@
 //
 // 改版須知:更新外殼檔案後,把下面的 CACHE 版本號 +1,離線快取就會刷新。
 
-const CACHE = 'tour-v83';
+const CACHE = 'tour-v84';
 
 const SHELL = [
   './',
@@ -57,8 +57,8 @@ function networkFirst(req) {
       if (!settled) caches.match(req).then((hit) => { if (hit && !settled) { settled = true; resolve(hit); } });
     }, 4000);
     fetch(req).then((res) => {
-      const copy = res.clone();
-      caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {});
+      // 只快取成功的回應:別把 404/500 的錯誤頁存起來,否則離線時會拿錯誤頁當 App
+      if (res.ok) { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {}); }
       if (!settled) { settled = true; clearTimeout(timer); resolve(res); }
     }).catch(() => {
       if (!settled) { settled = true; clearTimeout(timer); fromCache(); }
@@ -78,8 +78,7 @@ self.addEventListener('fetch', (e) => {
     e.respondWith(
       caches.match(req).then((hit) =>
         hit || fetch(req).then((res) => {
-          const copy = res.clone();
-          caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {});
+          if (res.ok) { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {}); }
           return res;
         }).catch(() => hit)
       )
