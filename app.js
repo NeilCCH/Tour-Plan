@@ -12,7 +12,7 @@
 import { db, CATEGORIES, STATUSES, DEFAULT_STAY } from './db.js';
 import { geocode, geocodeCandidates, legModes, modeEstimate, orderFromStart, nearestOrder, kmeansDays, orderClusters, haversine } from './geo.js';
 
-const APP_VERSION = 'v84'; // 顯示在帳號視窗,方便確認手機跑的是哪一版
+const APP_VERSION = 'v85'; // 顯示在帳號視窗,方便確認手機跑的是哪一版
 const app = document.getElementById('app');
 const header = document.getElementById('header');
 
@@ -169,7 +169,7 @@ function nameFor(id) {
   if (!id) return '';
   if (id === currentUser?.id) return displayName();
   const p = profileCache[id];
-  return p ? (p.nickname || p.email || '協作者') : '協作者';
+  return p ? (p.nickname || '協作者') : '協作者';
 }
 
 function setHeader(title, showBack) {
@@ -1088,14 +1088,18 @@ function openShareSheet(trip) {
   const isOwner = trip.ownerId === currentUser?.id;
   openSheet(`
     <h2>${ic('link')} 分享 / 邀請協作</h2>
+    ${isOwner ? '' : '<p class="meta" style="margin-bottom:.8rem">分享設定、邀請與移除協作者只有<b>發起人</b>能操作;你可以查看目前的狀態。</p>'}
     <div class="toggle-row">
       <div><b>公開分享</b><div class="desc">開啟後,任何人有連結都能唯讀檢視這趟行程</div></div>
-      <div class="chip ${trip.public ? 'on' : ''}" id="f-public">${trip.public ? '已公開' : '未公開'}</div>
+      ${isOwner
+        ? `<div class="chip ${trip.public ? 'on' : ''}" id="f-public">${trip.public ? '已公開' : '未公開'}</div>`
+        : `<span class="meta">${trip.public ? '已公開' : '未公開'}</span>`}
     </div>
     <div id="f-sharelink" class="sharelink" style="${trip.public ? '' : 'display:none'}">
       <input id="f-shareurl" readonly value="${esc(location.origin + location.pathname + '#/share/' + trip.id)}">
       <button type="button" class="btn ghost" id="f-copy" style="width:auto;padding:.6rem 1rem">複製</button>
     </div>
+    ${isOwner ? `
     <div class="toggle-row">
       <div><b>邀請協作</b><div class="desc">產生連結,對方登入後可一起編輯</div></div>
       <button type="button" class="chip" id="f-invite">${trip.inviteCode ? '重新產生' : '產生連結'}</button>
@@ -1104,12 +1108,12 @@ function openShareSheet(trip) {
       <input id="f-inviteurl" readonly value="${trip.inviteCode ? esc(location.origin + location.pathname + '#/join/' + trip.id + '/' + trip.inviteCode) : ''}">
       <button type="button" class="btn ghost" id="f-invitecopy" style="width:auto;padding:.6rem 1rem">複製</button>
     </div>
-    <label class="field" style="margin-top:.5rem"><span class="lab">或用 Email 邀請(對方會收到 App 內通知)</span>
+    <label class="field" style="margin-top:.5rem"><span class="lab">或用 Email 邀請(請輸入對方註冊用的完整 Email;對方會收到 App 內通知)</span>
       <div style="display:flex;gap:.5rem">
         <input id="f-invemail" type="email" placeholder="對方註冊用的 email">
         <button type="button" class="btn ghost" id="f-invsend" style="width:auto;padding:.6rem 1rem">邀請</button>
       </div></label>
-    <div id="f-invmsg" class="meta" style="min-height:1.1em;margin-bottom:.6rem"></div>
+    <div id="f-invmsg" class="meta" style="min-height:1.1em;margin-bottom:.6rem"></div>` : ''}
     <div class="section-title" style="margin-top:.6rem">協作者名單</div>
     <div id="f-members" class="members">載入中…</div>
     <div class="btn-row">
@@ -1118,9 +1122,9 @@ function openShareSheet(trip) {
   `, (sheet, close) => {
     // 公開分享開關
     let pub = !!trip.public;
-    const pubChip = sheet.querySelector('#f-public');
+    const pubChip = sheet.querySelector('#f-public');   // 只有發起人有這顆
     const linkBox = sheet.querySelector('#f-sharelink');
-    pubChip.onclick = async () => {
+    if (pubChip) pubChip.onclick = async () => {
       pub = !pub;
       pubChip.classList.toggle('on', pub);
       pubChip.textContent = pub ? '已公開' : '未公開';
@@ -1139,7 +1143,7 @@ function openShareSheet(trip) {
     const inviteBox = sheet.querySelector('#f-invitelink');
     const inviteInput = sheet.querySelector('#f-inviteurl');
     const linkFor = (code) => location.origin + location.pathname + '#/join/' + trip.id + '/' + code;
-    inviteBtn.onclick = async () => {
+    if (inviteBtn) inviteBtn.onclick = async () => {
       const code = (crypto.randomUUID ? crypto.randomUUID().replace(/-/g, '') : Math.random().toString(36).slice(2)).slice(0, 12);
       await db.updateTrip(trip.id, { inviteCode: code });
       trip.inviteCode = code;
@@ -1147,7 +1151,8 @@ function openShareSheet(trip) {
       inviteBox.style.display = '';
       inviteBtn.textContent = '重新產生';
     };
-    sheet.querySelector('#f-invitecopy').onclick = () => {
+    const inviteCopy = sheet.querySelector('#f-invitecopy');
+    if (inviteCopy) inviteCopy.onclick = () => {
       navigator.clipboard?.writeText(inviteInput.value).then(() => {
         const b = sheet.querySelector('#f-invitecopy'); b.textContent = '已複製';
         setTimeout(() => { b.textContent = '複製'; }, 1500);
@@ -1168,7 +1173,7 @@ function openShareSheet(trip) {
       }
       membersBox.innerHTML = ids.map((id) => {
         const p = byId.get(id);
-        const name = (p && (p.nickname || p.email)) || '協作者';
+        const name = (p && p.nickname) || '協作者';
         const online = onlineIds.has(id);
         const seen = presenceSeen[`${trip.id}:${id}`];
         const status = online
@@ -1196,7 +1201,7 @@ function openShareSheet(trip) {
       if (!cloud || !cloud.findProfileByEmail) { invMsg.style.color = 'var(--danger)'; invMsg.textContent = '雲端未載入(可能離線)'; return; }
       invMsg.style.color = 'var(--text-dim)'; invMsg.textContent = '查詢中…';
       const prof = await cloud.findProfileByEmail(em).catch(() => null);
-      if (!prof) { invMsg.style.color = 'var(--danger)'; invMsg.textContent = '找不到這個 email(對方需先註冊並登入過一次)'; return; }
+      if (!prof) { invMsg.style.color = 'var(--danger)'; invMsg.textContent = '找不到這個 email(請確認是對方註冊用的完整 Email)'; return; }
       if (prof.id === currentUser.id) { invMsg.style.color = 'var(--danger)'; invMsg.textContent = '不能邀請自己'; return; }
       if ((trip.members || []).includes(prof.id)) { invMsg.style.color = 'var(--danger)'; invMsg.textContent = '對方已經是協作者'; return; }
       const { error } = await cloud.createInvite(trip.id, trip.name, displayName(), prof.id);

@@ -55,23 +55,29 @@ export async function joinTrip(tripId, code) {
 }
 
 // ---- 使用者暱稱 profiles(供顯示「Neo,您好」與 email 邀請查詢)------------------
+// 暱稱對所有登入者公開;Email 不公開(資料庫已把 Email 欄位的讀取權收掉)。
+// 寫入與「用 Email 找人」走後端函式;資料庫還沒跑新版 schema(函式不存在)時退回舊做法。
 export async function saveProfile(nickname) {
   const user = await currentUser(); if (!user) return;
+  const viaFn = await supabase.rpc('save_profile', { p_nickname: nickname });
+  if (!viaFn.error) return viaFn;
   return supabase.from('profiles').upsert({ id: user.id, email: user.email, nickname, updated_at: Date.now() });
 }
 export async function getMyProfile() {
   const user = await currentUser(); if (!user) return null;
-  const { data } = await supabase.from('profiles').select('nickname,email').eq('id', user.id).maybeSingle();
+  const { data } = await supabase.from('profiles').select('nickname').eq('id', user.id).maybeSingle();
   return data || null;
 }
+// 用 Email 找人(Email 邀請用):要完整 Email 才查得到,回傳 { id, nickname }
 export async function findProfileByEmail(email) {
-  // 大小寫不敏感,避免因大小寫不同而找不到人
-  const { data } = await supabase.from('profiles').select('id,nickname,email').ilike('email', email).limit(1);
+  const viaFn = await supabase.rpc('find_user_by_email', { p_email: email });
+  if (!viaFn.error) return (viaFn.data && viaFn.data[0]) || null;
+  const { data } = await supabase.from('profiles').select('id,nickname').ilike('email', email).limit(1);
   return (data && data[0]) || null;
 }
 export async function getProfiles(ids) {
   if (!ids || !ids.length) return [];
-  const { data } = await supabase.from('profiles').select('id,nickname,email').in('id', ids);
+  const { data } = await supabase.from('profiles').select('id,nickname').in('id', ids);
   return data || [];
 }
 

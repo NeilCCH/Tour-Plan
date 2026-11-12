@@ -49,10 +49,15 @@ create policy "own trips"   on public.trips   for all using (auth.uid() = user_i
 create policy "own places"  on public.places  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 create policy "own moments" on public.moments for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 
--- 授權:登入使用者可透過 API 存取(實際能存取哪些列,仍受上面 RLS 限制)
-grant all on public.trips   to authenticated;
-grant all on public.places  to authenticated;
-grant all on public.moments to authenticated;
+-- 授權:登入使用者可透過 API 讀取、新增、修改(實際能存取哪些列,仍受上面 RLS 限制)。
+-- 不開放「永久刪除」:App 的刪除一律是軟刪除(deleted=true),資料列仍留在雲端可救回;
+-- 這樣任何人(包含協作者)都無法透過 API 把雲端資料真的抹掉。
+grant select, insert, update on public.trips   to authenticated;
+grant select, insert, update on public.places  to authenticated;
+grant select, insert, update on public.moments to authenticated;
+revoke delete, truncate on public.trips   from authenticated;
+revoke delete, truncate on public.places  from authenticated;
+revoke delete, truncate on public.moments from authenticated;
 
 -- ===========================================================================
 -- 公開分享(唯讀):未登入的人「不能」直接讀資料表,只能透過下面兩個函式拿到公開行程。
@@ -97,11 +102,45 @@ grant execute on function public.public_places(uuid) to anon, authenticated;
 -- 成員可讀寫「自己是成員」的行程與其地點/Moment;加入動作由 RPC 憑邀請碼完成。
 -- ===========================================================================
 
--- 成員可讀寫自己是成員的行程
+-- 成員可讀、可改自己是成員的行程(不能新增成別人的、不能刪);能改哪些欄位見下方的保護觸發器
 drop policy if exists "member trips" on public.trips;
-create policy "member trips" on public.trips for all
+drop policy if exists "member read trips" on public.trips;
+drop policy if exists "member update trips" on public.trips;
+create policy "member read trips" on public.trips for select
+  using (coalesce(data->'members', '[]'::jsonb) ? auth.uid()::text);
+create policy "member update trips" on public.trips for update
   using  (coalesce(data->'members', '[]'::jsonb) ? auth.uid()::text)
   with check (coalesce(data->'members', '[]'::jsonb) ? auth.uid()::text);
+
+-- 只有發起人(擁有者)有最高權限。協作者透過 API 修改行程列時,下列項目一律維持原值:
+--   擁有者(user_id)、刪除狀態(deleted)、成員名單、邀請碼、公開分享、照片保存期限。
+-- 也就是:協作者不能刪掉整趟、不能加人/踢人、不能改分享與保存期限、不能把擁有權轉給自己。
+-- 用「維持原值」而不是「報錯」:協作者的 App 同步時會整列推上來,報錯會讓他整個同步失敗。
+-- 後端函式(join_trip / accept_invite / remove_member,以資料庫擁有者身分執行)與後台不受此限。
+create or replace function public.guard_trip_update()
+returns trigger language plpgsql as $$
+declare
+  k text;
+  protected text[] := array['members', 'inviteCode', 'public', 'photoRetentionDays', 'ownerId', 'deleted'];
+begin
+  if current_user not in ('authenticated', 'anon') then return new; end if;
+  new.user_id := old.user_id;                                -- 擁有權不可經由 API 轉移
+  if auth.uid() = old.user_id then return new; end if;       -- 發起人:完整權限
+  new.deleted := old.deleted;
+  foreach k in array protected loop
+    if old.data ? k then new.data := jsonb_set(new.data, array[k], old.data->k, true);
+    else new.data := new.data - k; end if;
+    if coalesce(old.data->'fts', '{}'::jsonb) ? k then
+      new.data := jsonb_set(new.data, array['fts', k], old.data->'fts'->k, true);
+    elsif new.data ? 'fts' then
+      new.data := new.data #- array['fts', k];
+    end if;
+  end loop;
+  return new;
+end; $$;
+drop trigger if exists trips_guard on public.trips;
+create trigger trips_guard before update on public.trips
+  for each row execute function public.guard_trip_update();
 
 -- 只要能存取所屬行程(擁有者或成員),就能讀寫其地點
 drop policy if exists "trip access places" on public.places;
@@ -154,16 +193,46 @@ create table if not exists public.profiles (
   updated_at bigint not null default 0
 );
 alter table public.profiles enable row level security;
-grant select, insert, update on public.profiles to authenticated;
 
--- 讀:登入者都可讀(供顯示暱稱與 email 邀請查詢)
+-- 讀:登入者都可讀「暱稱」;Email 欄位不開放(用欄位層級的權限擋掉,連自己那列也只能從登入資訊得知)。
+-- 寫:不開放直接寫表,一律走下面的 save_profile(Email 由後端從登入帳號帶入,不能自己亂填冒充別人)。
+revoke all on public.profiles from anon, authenticated;
+grant select (id, nickname, updated_at) on public.profiles to authenticated;
 drop policy if exists "read profiles" on public.profiles;
 create policy "read profiles" on public.profiles for select using (auth.uid() is not null);
-
--- 寫:只能新增/修改自己的
 drop policy if exists "write own profile" on public.profiles;
-create policy "write own profile" on public.profiles for all
-  using (id = auth.uid()) with check (id = auth.uid());
+
+-- 儲存自己的暱稱
+create or replace function public.save_profile(p_nickname text)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if auth.uid() is null then raise exception 'not authenticated'; end if;
+  insert into public.profiles (id, email, nickname, updated_at)
+  values (auth.uid(),
+          (select u.email from auth.users u where u.id = auth.uid()),
+          nullif(left(btrim(coalesce(p_nickname, '')), 40), ''),
+          (extract(epoch from now()) * 1000)::bigint)
+  on conflict (id) do update
+     set email = excluded.email,
+         nickname = coalesce(excluded.nickname, public.profiles.nickname),
+         updated_at = excluded.updated_at;
+end; $$;
+revoke all on function public.save_profile(text) from public;
+grant execute on function public.save_profile(text) to authenticated;
+
+-- 用 Email 找人(給「Email 邀請」用):要輸入完整 Email 才查得到,只回傳 id 與暱稱,不回傳 Email。
+create or replace function public.find_user_by_email(p_email text)
+returns table (id uuid, nickname text) language sql stable security definer set search_path = public as $$
+  select u.id, p.nickname
+    from auth.users u
+    left join public.profiles p on p.id = u.id
+   where auth.uid() is not null
+     and btrim(coalesce(p_email, '')) <> ''
+     and lower(u.email) = lower(btrim(p_email))
+   limit 1;
+$$;
+revoke all on function public.find_user_by_email(text) from public;
+grant execute on function public.find_user_by_email(text) to authenticated;
 
 -- ===========================================================================
 -- Email 邀請 + App 內通知 + 接受制 + 協作者管理
@@ -189,15 +258,14 @@ grant update (status) on public.invitations to authenticated;
 drop policy if exists "read invites" on public.invitations;
 create policy "read invites" on public.invitations for select
   using (inviter_id = auth.uid() or invitee_id = auth.uid());
--- 建立:只能以自己為邀請人,而且自己必須是那趟的擁有者或協作成員。
+-- 建立:只能以自己為邀請人,而且自己必須是那趟的發起人(擁有者)——加人是發起人的權限。
 -- (少了後半句的話,任何登入者只要知道行程 id,就能「自己邀請自己」再接受,混進別人的行程。)
 drop policy if exists "create invites" on public.invitations;
 create policy "create invites" on public.invitations for insert
   with check (
     inviter_id = auth.uid()
     and exists (select 1 from public.trips t
-      where t.id = trip_id and not t.deleted
-        and (t.user_id = auth.uid() or coalesce(t.data->'members','[]'::jsonb) ? auth.uid()::text))
+      where t.id = trip_id and not t.deleted and t.user_id = auth.uid())
   );
 -- 更新:邀請人或被邀請人可改(接受/拒絕/取消)
 drop policy if exists "update invites" on public.invitations;
@@ -211,13 +279,13 @@ returns uuid language plpgsql security definer set search_path = public as $$
 declare v_trip uuid;
 begin
   if auth.uid() is null then raise exception 'not authenticated'; end if;
-  -- 邀請必須是發給我的、還沒處理,而且「邀請人現在仍有權限」(是那趟的擁有者或成員)
+  -- 邀請必須是發給我的、還沒處理,而且邀請人是那趟的發起人
   select i.trip_id into v_trip
     from public.invitations i
     join public.trips t on t.id = i.trip_id
    where i.id = p_invite and i.invitee_id = auth.uid() and i.status = 'pending'
      and not t.deleted
-     and (t.user_id = i.inviter_id or coalesce(t.data->'members','[]'::jsonb) ? i.inviter_id::text);
+     and t.user_id = i.inviter_id;
   if v_trip is null then raise exception 'invite not found'; end if;
   update public.trips
      set data = jsonb_set(
@@ -286,30 +354,39 @@ create policy "trip members insert photos" on storage.objects for insert to auth
         and (t.user_id = auth.uid() or coalesce(t.data->'members','[]'::jsonb) ? auth.uid()::text))
   );
 
--- 覆蓋(upsert 需要):擁有者或協作成員
+-- 覆蓋、刪除:必須仍是這趟的擁有者或成員,而且是「發起人」或「該則記錄的作者」。
+-- (路徑第二段資料夾 = 記錄 id。協作者只能動自己那幾則的照片,不能把整趟的照片清掉或蓋掉。)
 drop policy if exists "trip members update photos" on storage.objects;
 create policy "trip members update photos" on storage.objects for update to authenticated
   using (
     bucket_id = 'photos'
     and exists (select 1 from public.trips t
       where t.id::text = (storage.foldername(name))[1]
-        and (t.user_id = auth.uid() or coalesce(t.data->'members','[]'::jsonb) ? auth.uid()::text))
+        and (t.user_id = auth.uid()
+             or (coalesce(t.data->'members','[]'::jsonb) ? auth.uid()::text
+                 and exists (select 1 from public.moments m
+                              where m.id::text = (storage.foldername(name))[2] and m.user_id = auth.uid()))))
   )
   with check (
     bucket_id = 'photos'
     and exists (select 1 from public.trips t
       where t.id::text = (storage.foldername(name))[1]
-        and (t.user_id = auth.uid() or coalesce(t.data->'members','[]'::jsonb) ? auth.uid()::text))
+        and (t.user_id = auth.uid()
+             or (coalesce(t.data->'members','[]'::jsonb) ? auth.uid()::text
+                 and exists (select 1 from public.moments m
+                              where m.id::text = (storage.foldername(name))[2] and m.user_id = auth.uid()))))
   );
 
--- 刪除:擁有者或協作成員(刪記錄時順手清雲端照片)
 drop policy if exists "trip members delete photos" on storage.objects;
 create policy "trip members delete photos" on storage.objects for delete to authenticated
   using (
     bucket_id = 'photos'
     and exists (select 1 from public.trips t
       where t.id::text = (storage.foldername(name))[1]
-        and (t.user_id = auth.uid() or coalesce(t.data->'members','[]'::jsonb) ? auth.uid()::text))
+        and (t.user_id = auth.uid()
+             or (coalesce(t.data->'members','[]'::jsonb) ? auth.uid()::text
+                 and exists (select 1 from public.moments m
+                              where m.id::text = (storage.foldername(name))[2] and m.user_id = auth.uid()))))
   );
 
 -- ===========================================================================
