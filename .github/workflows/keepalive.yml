@@ -1,45 +1,47 @@
 name: Supabase keepalive
 
-# 免費 Supabase 專案閒置就會被自動暫停;輕量的「讀取」可能不被算作活躍。
-# 這個排程每天對資料庫做一次「真的寫入」(心跳),是明確的資料庫活動,最能避免被暫停。
+# 免費 Supabase 專案閒置就會被自動暫停。這個排程每天呼叫一次資料庫的 keepalive_ping()
+# 「打卡」函式,寫入一筆心跳(真正的資料庫寫入),讓專案保持活躍。
 #
-# 需要兩個一次性設定:
-#   1) 在 Supabase SQL Editor 跑最新的 supabase-schema.sql(建立 public.keepalive 表)
-#   2) 在 repo 設定一個加密 Secret:SUPABASE_SERVICE_ROLE(值=Supabase 的 service_role 金鑰)
-#      GitHub → repo → Settings → Secrets and variables → Actions → New repository secret
-#      ⚠️ service_role 是機密,只放在 GitHub Secret,不要放進程式碼或分享出去。
-# 也可到 Actions 分頁手動按「Run workflow」立即執行一次。
+# 不需要任何機密金鑰:用的是本來就公開在 supabase-config.js 的 anon 金鑰。
+# keepalive_ping() 只會更新一格時間戳,別人呼叫也沒有影響(見 supabase-schema.sql)。
+#
+# 若資料庫還沒跑過含 keepalive_ping() 的新版 SQL,會先退回「讀取一次」的舊做法維持連線,
+# 並在執行紀錄留下提醒。也可到 Actions 分頁手動按「Run workflow」立即執行一次。
 
 on:
   schedule:
-    - cron: '11 20 * * *'   # 每天 UTC 20:11(台灣 04:11)寫一次心跳
+    - cron: '11 20 * * *'   # 每天 UTC 20:11(台灣 04:11)打卡一次
   workflow_dispatch:          # 允許手動執行
 
 jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Heartbeat write to Supabase（保持免費專案活躍）
-        env:
-          KEY: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+      - name: Heartbeat（保持免費專案活躍）
         run: |
-          if [ -z "$KEY" ]; then
-            echo "缺少 Secret：SUPABASE_SERVICE_ROLE(請到 repo Settings → Secrets 新增)"; exit 1
-          fi
-          URL="https://pwjyqxpadaadvbecrckw.supabase.co/rest/v1/keepalive"
-          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          code=$(curl -s -o /tmp/resp.txt -w "%{http_code}" -X POST "$URL" \
-            -H "apikey: $KEY" \
-            -H "Authorization: Bearer $KEY" \
-            -H "Content-Type: application/json" \
-            -H "Prefer: resolution=merge-duplicates" \
-            -d "{\"id\":1,\"last_ping\":\"$NOW\"}")
-          echo "HTTP status: $code"
-          echo "Response: $(cat /tmp/resp.txt)"
-          # 寫入成功=2xx;其餘(含連不上 000、專案暫停時 DNS 解析失敗)都算失敗
-          if [ -n "$code" ] && [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+          BASE="https://pwjyqxpadaadvbecrckw.supabase.co"
+          KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InB3anlxeHBhZGFhZHZiZWNyY2t3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODUzNzczMDcsImV4cCI6MjEwMDk1MzMwN30.PmWg8Charfop5-6RL0N40QsarISXTlwrlvRILJ7vIEQ"
+
+          # 1) 打卡:真正寫入一筆心跳
+          code=$(curl -s -o /tmp/resp.txt -w "%{http_code}" -X POST "$BASE/rest/v1/rpc/keepalive_ping" \
+            -H "apikey: $KEY" -H "Authorization: Bearer $KEY" \
+            -H "Content-Type: application/json" -d '{}' || true)
+          echo "打卡 HTTP $code：$(cat /tmp/resp.txt 2>/dev/null)"
+          if [ "$code" -ge 200 ] 2>/dev/null && [ "$code" -lt 300 ]; then
             echo "OK：心跳已寫入,專案保持活躍。"
-          else
-            echo "心跳失敗（$code）——專案可能暫停中,請先到 Supabase 後台 Restore,或確認 Secret / keepalive 表已建立。"
-            exit 1
+            exit 0
           fi
+
+          # 2) 打卡函式還不存在(資料庫還沒跑新版 SQL):退回讀取一次,至少維持連線
+          code2=$(curl -s -o /tmp/resp2.txt -w "%{http_code}" \
+            -H "apikey: $KEY" -H "Authorization: Bearer $KEY" \
+            "$BASE/rest/v1/trips?select=id&limit=1" || true)
+          echo "退回讀取 HTTP $code2"
+          if [ "$code2" -ge 200 ] 2>/dev/null && [ "$code2" -lt 500 ]; then
+            echo "::warning::資料庫有回應,但還沒有 keepalive_ping 函式。請到 Supabase SQL Editor 重跑最新的 supabase-schema.sql。"
+            exit 0
+          fi
+
+          echo "::error::連不到 Supabase（$code / $code2）——專案可能已被暫停,請到 Supabase 後台按 Restore。"
+          exit 1

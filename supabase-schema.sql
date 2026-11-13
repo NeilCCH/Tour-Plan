@@ -390,15 +390,26 @@ create policy "trip members delete photos" on storage.objects for delete to auth
   );
 
 -- ===========================================================================
--- 保活心跳表:GitHub Actions 每天用 service_role 寫入一筆(真正的資料庫活動),
--- 讓免費專案不會因閒置被自動暫停。只給 service_role 用(它繞過 RLS);
--- 開啟 RLS 但不加任何政策 = 擋掉 anon/authenticated,一般使用者碰不到。
+-- 保活心跳表:GitHub Actions 每天寫入一筆(真正的資料庫活動),讓免費專案不會因閒置被自動暫停。
+-- 一般使用者不能直接讀寫這張表,只能透過下面的 keepalive_ping() 打卡。
 -- ===========================================================================
 create table if not exists public.keepalive (
   id int primary key default 1,
   last_ping timestamptz not null default now()
 );
 alter table public.keepalive enable row level security;
+revoke all on public.keepalive from anon, authenticated;
+
+-- 保活「打卡」:每天由 GitHub Actions 用公開的 anon 金鑰呼叫一次,寫入一筆心跳(真正的資料庫寫入)。
+-- 不需要任何機密金鑰。它只會更新上面這一格時間,別人就算呼叫也沒有任何影響。
+create or replace function public.keepalive_ping()
+returns timestamptz language sql security definer set search_path = public as $$
+  insert into public.keepalive (id, last_ping) values (1, now())
+  on conflict (id) do update set last_ping = excluded.last_ping
+  returning last_ping;
+$$;
+revoke all on function public.keepalive_ping() from public;
+grant execute on function public.keepalive_ping() to anon, authenticated;
 
 
 -- 讓 API 立刻認得上面新增/修改的函式(Supabase 平常會自動做,這行是保險)
